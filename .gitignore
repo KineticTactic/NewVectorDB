@@ -1,0 +1,13 @@
+.venv/
+data/
+results/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+*.parquet
+*.db
+*.tar.gz

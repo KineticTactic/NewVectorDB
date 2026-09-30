@@ -1,0 +1,47 @@
+dataset: synthetic
+
+index:
+  leaf_size: 200
+  branching_factor: 4
+  seed: 0
+
+query:
+  k: 10
+  n_postings: 1
+
+maintain:
+  memtable_limit: 2000
+  compaction_threshold: 4
+
+grid:
+  - index: {depth: 1}
+    query: {beam_widths: [8]}
+    maintain: {strategy: outofplace}
+
+  - index: {depth: 2}
+    query: {beam_widths: [8]}
+    maintain: {strategy: outofplace}
+
+  - index: {depth: 3}
+    query: {beam_widths: [8]}
+    maintain: {strategy: outofplace}
+
+  - index: {depth: 4}
+    query: {beam_widths: [8]}
+    maintain: {strategy: outofplace}
+
+  - index: {depth: 1}
+    query: {beam_widths: [8]}
+    maintain: {strategy: inplace}
+
+  - index: {depth: 2}
+    query: {beam_widths: [8]}
+    maintain: {strategy: inplace}
+
+  - index: {depth: 3}
+    query: {beam_widths: [8]}
+    maintain: {strategy: inplace}
+
+  - index: {depth: 4}
+    query: {beam_widths: [8]}
+    maintain: {strategy: inplace}
