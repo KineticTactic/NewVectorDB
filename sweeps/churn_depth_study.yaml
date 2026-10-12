@@ -1,0 +1,54 @@
+dataset: synthetic
+initial_size: 5000
+reserve_size: 5000
+
+index:
+  leaf_size: 200
+  branching_factor: 4
+  seed: 0
+
+query:
+  k: 10
+  beam_widths: [8]
+  n_postings: 1
+
+maintain:
+  memtable_limit: 500
+  compaction_threshold: 4
+  split_threshold: 400
+  n_reassign_neighbours: 8
+  tombstone_rebuild_frac: 0.2
+
+churn:
+  operations: 2000
+  checkpoint_interval: 500
+  insert_prob: 0.6
+  seed: 42
+  workload: mixed
+  flush_memtable_at_checkpoint: false
+
+grid:
+  - index: {depth: 1}
+    maintain: {strategy: outofplace}
+
+  - index: {depth: 2}
+    maintain: {strategy: outofplace}
+
+  - index: {depth: 3}
+    maintain: {strategy: outofplace}
+
+  - index: {depth: 4}
+    maintain: {strategy: outofplace}
+
+  - index: {depth: 1}
+    maintain: {strategy: inplace}
+
+  - index: {depth: 2}
+    maintain: {strategy: inplace}
+
+  - index: {depth: 3}
+    maintain: {strategy: inplace}
+
+  - index: {depth: 4}
+    maintain: {strategy: inplace}
+

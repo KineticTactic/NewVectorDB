@@ -31,6 +31,9 @@ class Counters:
     compaction_events: int = 0
     vectors_reclustered: int = 0
     npa_violations_detected: int = 0
+    flushes: int = 0
+    forced_checkpoint_flushes: int = 0
+    hierarchy_rebuilds: int = 0
 
     # -----------------------------------------------------------------------
 
@@ -69,6 +72,9 @@ class Counters:
             "compaction_events": self.compaction_events,
             "vectors_reclustered": self.vectors_reclustered,
             "npa_violations_detected": self.npa_violations_detected,
+            "flushes": self.flushes,
+            "forced_checkpoint_flushes": self.forced_checkpoint_flushes,
+            "hierarchy_rebuilds": self.hierarchy_rebuilds,
         }
 
     def to_dict(self) -> dict:
@@ -92,4 +98,7 @@ class Counters:
         c.compaction_events += other.compaction_events
         c.vectors_reclustered += other.vectors_reclustered
         c.npa_violations_detected += other.npa_violations_detected
+        c.flushes += other.flushes
+        c.forced_checkpoint_flushes += other.forced_checkpoint_flushes
+        c.hierarchy_rebuilds += other.hierarchy_rebuilds
         return c

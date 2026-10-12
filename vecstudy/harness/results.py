@@ -13,6 +13,7 @@ import datetime
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -56,7 +57,7 @@ def make_result_row(
     row["unit_count"] = int(unit_count)
     row["dataset_checksum"] = dataset_checksum
     row["git_sha"] = _git_sha()
-    row["timestamp"] = datetime.datetime.utcnow().isoformat()
+    row["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if extra:
         row.update(extra)
     return row
@@ -84,12 +85,19 @@ def _row_to_table(row: dict) -> pa.Table:
     """Convert a flat dict row to a single-row PyArrow table."""
     arrays = {}
     for k, v in row.items():
-        if isinstance(v, bool):
+        if v is None:
+            if "delta" in k or "frac" in k or "mean" in k or "ratio" in k:
+                arrays[k] = pa.array([None], type=pa.float64())
+            elif "depth" in k or "size" in k or "seed" in k or "limit" in k or "threshold" in k or "count" in k:
+                arrays[k] = pa.array([None], type=pa.int64())
+            else:
+                arrays[k] = pa.array([None], type=pa.string())
+        elif isinstance(v, bool):
             arrays[k] = pa.array([v], type=pa.bool_())
-        elif isinstance(v, int):
-            arrays[k] = pa.array([v], type=pa.int64())
-        elif isinstance(v, float):
-            arrays[k] = pa.array([v], type=pa.float64())
+        elif isinstance(v, (int, np.integer)):
+            arrays[k] = pa.array([int(v)], type=pa.int64())
+        elif isinstance(v, (float, np.floating)):
+            arrays[k] = pa.array([float(v)], type=pa.float64())
         elif isinstance(v, str):
             arrays[k] = pa.array([v], type=pa.string())
         elif isinstance(v, list):

@@ -45,6 +45,31 @@ class Segment:
     def n_vectors(self) -> int:
         return sum(len(p.owned) for p in self.postings)
 
+    def clone(self) -> Segment:
+        """Create an independent copy of this segment with distinct levels and postings."""
+        new_levels = [
+            HierarchyLevel(
+                centroids=lvl.centroids.copy(),
+                children=[c.copy() for c in lvl.children],
+            )
+            for lvl in self.levels
+        ]
+        new_postings = [
+            Posting(
+                id=p.id,
+                centroid=p.centroid.copy(),
+                members=p.members.copy(),
+                owned=p.owned.copy(),
+            )
+            for p in self.postings
+        ]
+        return Segment(
+            levels=new_levels,
+            postings=new_postings,
+            vectors=self.vectors,
+            tombstones=set(self.tombstones),
+        )
+
     # ------------------------------------------------------------------
     # Factory: build a sealed Segment from a set of vector ids
     # ------------------------------------------------------------------

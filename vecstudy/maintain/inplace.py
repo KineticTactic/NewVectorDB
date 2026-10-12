@@ -31,6 +31,7 @@ class InPlaceMaintainer(IndexMaintainer):
         cfg_maintain: MaintainConfig,
         counters: Counters,
         initial_vids: np.ndarray | None = None,
+        initial_segment: Segment | None = None,
     ) -> None:
         self._vectors = vectors
         self._cfg_index = cfg_index
@@ -38,7 +39,9 @@ class InPlaceMaintainer(IndexMaintainer):
         self._counters = counters
         self._tombstones: set[VectorId] = set()
 
-        if initial_vids is not None and len(initial_vids) > 0:
+        if initial_segment is not None:
+            self._segment = initial_segment.clone()
+        elif initial_vids is not None and len(initial_vids) > 0:
             self._segment = Segment.build(
                 initial_vids, vectors, cfg_index, counters, tombstones=set()
             )
@@ -92,6 +95,7 @@ class InPlaceMaintainer(IndexMaintainer):
             "splits": self._counters.splits,
             "vectors_reassigned": self._counters.vectors_reassigned,
             "npa_violations_detected": self._counters.npa_violations_detected,
+            "hierarchy_rebuilds": self._counters.hierarchy_rebuilds,
             "tombstones": len(self._tombstones),
         }
 
@@ -152,10 +156,14 @@ class InPlaceMaintainer(IndexMaintainer):
         n_nbrs = self._cfg_maintain.n_reassign_neighbours
         leaf_centroids = self._segment.levels[-1].centroids
         K = len(leaf_centroids)
-        sims = sim_one_to_many(orig_centroid, leaf_centroids, self._counters, "build")
         n_search = min(n_nbrs + 2, K)
-        top_pids = _stable_top_k(-sims, n_search).tolist()
-        affected = sorted(set(top_pids) | {pid, new_pid})
+        sims_orig = sim_one_to_many(orig_centroid, leaf_centroids, self._counters, "build")
+        sims_c0 = sim_one_to_many(leaf_centroids[pid], leaf_centroids, self._counters, "build")
+        sims_c1 = sim_one_to_many(leaf_centroids[new_pid], leaf_centroids, self._counters, "build")
+        top_pids = set(_stable_top_k(-sims_orig, n_search).tolist())
+        top_pids.update(_stable_top_k(-sims_c0, n_search).tolist())
+        top_pids.update(_stable_top_k(-sims_c1, n_search).tolist())
+        affected = sorted(top_pids | {pid, new_pid})
 
         all_vids_set: set[int] = set()
         for ap in affected:
@@ -233,6 +241,7 @@ class InPlaceMaintainer(IndexMaintainer):
             depth=self._cfg_index.depth,
             counters=self._counters,
         )
+        self._counters.hierarchy_rebuilds += 1
         self._segment.levels = new_levels
 
     def _rebuild_posting(self, pid: int) -> None:
@@ -240,11 +249,5 @@ class InPlaceMaintainer(IndexMaintainer):
         tomb = list(self._tombstones)
         live_owned = p.owned[~np.isin(p.owned, tomb)]
         live_members = p.members[~np.isin(p.members, tomb)]
-        if len(live_owned) == 0:
-            new_p = Posting(p.id, p.centroid,
-                            np.array([], dtype=np.int64), np.array([], dtype=np.int64))
-        else:
-            new_c = self._vectors[live_owned].mean(axis=0).astype(np.float32)
-            new_p = Posting(p.id, new_c, live_members, live_owned)
-            self._segment.levels[-1].centroids[pid] = new_c
+        new_p = Posting(p.id, p.centroid, live_members, live_owned)
         self._segment.postings[pid] = new_p

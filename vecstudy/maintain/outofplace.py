@@ -26,6 +26,8 @@ class OutOfPlaceMaintainer(IndexMaintainer):
         cfg_index: IndexConfig,
         cfg_maintain: MaintainConfig,
         counters: Counters,
+        initial_vids: np.ndarray | None = None,
+        initial_segment: Segment | None = None,
     ) -> None:
         self._vectors = vectors
         self._cfg_index = cfg_index
@@ -33,8 +35,18 @@ class OutOfPlaceMaintainer(IndexMaintainer):
         self._counters = counters
 
         self._memtable: list[VectorId] = []          # buffered, not yet sealed
-        self._sealed: list[Segment] = []             # sealed segments
         self._tombstones: set[VectorId] = set()      # global tombstone set
+
+        if initial_segment is not None:
+            self._sealed: list[Segment] = [initial_segment.clone()]
+        elif initial_vids is not None and len(initial_vids) > 0:
+            seg = Segment.build(
+                initial_vids, self._vectors, self._cfg_index, self._counters,
+                tombstones=set()
+            )
+            self._sealed = [seg]
+        else:
+            self._sealed = []
 
     # ------------------------------------------------------------------
     def insert(self, vid: VectorId, vec: np.ndarray) -> None:
@@ -62,6 +74,10 @@ class OutOfPlaceMaintainer(IndexMaintainer):
             units.append(mem_seg)
         return units
 
+    def flush(self) -> None:
+        """Flush pending MemTable entries to a new sealed segment."""
+        self._flush()
+
     def stats(self) -> dict:
         return {
             "strategy": "outofplace",
@@ -69,6 +85,7 @@ class OutOfPlaceMaintainer(IndexMaintainer):
             "sealed_segments": len(self._sealed),
             "compaction_events": self._counters.compaction_events,
             "vectors_reclustered": self._counters.vectors_reclustered,
+            "flushes": self._counters.flushes,
             "tombstones": len(self._tombstones),
         }
 
@@ -89,6 +106,7 @@ class OutOfPlaceMaintainer(IndexMaintainer):
             tombstones=set()
         )
         self._sealed.append(seg)
+        self._counters.flushes += 1
         self._memtable = []
 
     def _compact(self) -> None:

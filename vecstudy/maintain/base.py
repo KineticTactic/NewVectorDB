@@ -41,3 +41,7 @@ class IndexMaintainer(ABC):
     def stats(self) -> dict:
         """Return a dict of current maintenance statistics."""
         ...
+
+    def flush(self) -> None:
+        """Flush any pending buffered updates to searchable units."""
+        pass
