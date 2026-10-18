@@ -50,7 +50,12 @@ A pair `(a, b)` is eligible iff:
    (`_leaf_parent_of`, `inplace.py:734`). At depth 1 there is no routing level,
    the mapping is empty, and every leaf is a sibling;
 3. `live_owned(a) + live_owned(b) <= split_threshold` — the same hysteresis the
-   split path uses, so a merge cannot immediate re-split.
+   split path uses. This bounds the *survivor's* occupancy: its live owned set is
+   a subset of the union, so the merged posting itself is never over threshold.
+   It does **not** stop a merge from pushing a *neighbour* over threshold —
+   reassignment can scatter union vectors into other postings, which
+   `_split_oversize` then splits. The measured consequence (merge/split mutual
+   undo at small thresholds) is in `R1_T5_Report.md` §3.
 
 ### 1.3 Partner selection (deterministic)
 
@@ -191,9 +196,11 @@ theoretically covered.
 
 Distance work is attributed by the production counters (the merge path charges
 the `build` bucket, the same bucket the split repair uses). Deterministic churn on
-1 200 2-D clustered unit vectors, 10 clusters, `branching_factor=8`,
-`initial_n=600`, 800 operations, `insert_prob=0.35`, seed 7; `merge_threshold`
-defaulted to `split_threshold // 2`:
+600 2-D clustered unit vectors (10 clusters, angular spread 0.05),
+`branching_factor=8`, `leaf_size = split_threshold`, `initial_n=300`, 400
+operations, `insert_prob=0.35`, trace seed 7; `merge_threshold` defaulted to
+`split_threshold // 2`. **`K` is the final leaf count** (initial `K` is 15 at
+`split_threshold=20` and 8 at `split_threshold=40`).
 
 | workload | split_thr | depth | Δ | K | merges | splits | cand. examined | vectors reassigned | sim evals | audits |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -208,9 +215,13 @@ defaulted to `split_threshold // 2`:
 
 Observations:
 
-* Merge is roughly as frequent as split (it is the inverse operation, and the
-  churn rate is symmetric), so a merge-aware maintainer keeps `K` near a steady
-  state instead of only growing.
+* Merge is roughly as frequent as split. This is **not** a healthy inverse-operation
+  count: at small thresholds the two paths largely undo each other within a single
+  delete (a merge scatters its union into neighbours and `_split_oversize`
+  re-splits them). The identity
+  `K_initial + splits − merges − empty-leaf prunes = K_final` still holds and both
+  audits pass, but the structural work is high. Evidence and cause in
+  `R1_T5_Report.md` §3.
 * Candidate examination is cheap: `2.5` eligible pairs examined per merge at
   `split_threshold=40` (`13` at the tiny threshold 20, where many small leaves
   are simultaneously underfilled).
