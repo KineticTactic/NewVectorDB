@@ -86,12 +86,16 @@ def _maintainer(
     *,
     delta: float | None,
     split_threshold: int,
+    merge_threshold: int | None = None,
 ) -> tuple[InPlaceMaintainer, Counters]:
     cfg_index = IndexConfig(
         dim=X.shape[1], leaf_size=100, branching_factor=4, seed=0,
         depth=1, delta=delta,
     )
-    cfg_maintain = MaintainConfig(strategy="inplace", split_threshold=split_threshold)
+    cfg_maintain = MaintainConfig(
+        strategy="inplace", split_threshold=split_threshold,
+        merge_threshold=merge_threshold,
+    )
     counters = Counters()
     maint = InPlaceMaintainer(
         X, cfg_index, cfg_maintain, counters, initial_segment=segment
@@ -165,7 +169,9 @@ VID_A_RESERVE = 5  # 36.5 deg, inserted by the delete-then-split test
 VID_A_RESERVE2 = 6  # 37.0 deg
 
 
-def _fixture_a(delta: float | None = 0.5) -> tuple[InPlaceMaintainer, np.ndarray, Counters]:
+def _fixture_a(
+    delta: float | None = 0.5, merge_threshold: int | None = None
+) -> tuple[InPlaceMaintainer, np.ndarray, Counters]:
     angles = (36.0, 43.0, 30.0, 29.0, 80.0, 36.5, 37.0)
     X = np.stack([_unit(a) for a in angles]).astype(np.float32)
     seg = _segment(
@@ -173,7 +179,9 @@ def _fixture_a(delta: float | None = 0.5) -> tuple[InPlaceMaintainer, np.ndarray
         [_centroid_midpoint([36.0, 43.0]), 30.0, 80.0],
         [[], [VID_A_Q, VID_A_Q2], [VID_A_R]],
     )
-    maint, counters = _maintainer(X, seg, delta=delta, split_threshold=1)
+    maint, counters = _maintainer(
+        X, seg, delta=delta, split_threshold=1, merge_threshold=merge_threshold
+    )
     return maint, X, counters
 
 
@@ -609,7 +617,10 @@ def test_external_tombstones_are_excluded_from_live_membership():
 
 def test_split_after_delete_does_not_resurrect_the_vector():
     """A later split recomputes membership from live owned sets only."""
-    maint, X, counters = _fixture_a()
+    # Merges are disabled (merge_threshold=0) so this test isolates the split
+    # path: the emptied posting must stay in place and a later split must not
+    # bring the tombstoned id back.  Merge behaviour is covered separately.
+    maint, X, counters = _fixture_a(merge_threshold=0)
     maint.insert(VID_A_36, X[VID_A_36])
     maint.delete(VID_A_36)
     assert maint._segment.postings[0].owned.tolist() == []

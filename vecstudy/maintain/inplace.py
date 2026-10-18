@@ -288,6 +288,11 @@ class InPlaceMaintainer(IndexMaintainer):
                 self._counters.replicas_removed += 1
             self._rebuild_posting(pid)
 
+        # The delete may have pushed a posting below the underflow threshold.
+        # Merges are only ever driven from here — never from insert — so that
+        # the split path (insert) and the merge path (delete) stay separable.
+        self._merge_after_delete()
+
     def maintain(self) -> None:
         pass  # maintenance is eager
 
@@ -307,6 +312,13 @@ class InPlaceMaintainer(IndexMaintainer):
             "npa_violations_detected": self._counters.npa_violations_detected,
             "hierarchy_rebuilds": self._counters.hierarchy_rebuilds,
             "tombstones": len(self._tombstones),
+            "merge_threshold": self._effective_merge_threshold(),
+            "merges": self._counters.merges,
+            "merge_candidates_examined": self._counters.merge_candidates_examined,
+            "merge_vectors_reassigned": self._counters.merge_vectors_reassigned,
+            "merge_similarity_evaluations":
+                self._counters.merge_similarity_evaluations,
+            "merge_hierarchy_rebuilds": self._counters.merge_hierarchy_rebuilds,
         }
 
     # ------------------------------------------------------------------
@@ -674,3 +686,377 @@ class InPlaceMaintainer(IndexMaintainer):
         new_p = Posting(p.id, p.centroid, live_members, live_owned)
         self._segment.postings[pid] = new_p
         self._spread[pid] = _owned_spread(self._vectors, new_p.centroid, live_owned)
+
+    # ------------------------------------------------------------------
+    # Deletion-driven posting merges (underflow maintenance)
+    # ------------------------------------------------------------------
+    #
+    # A merge is the structural inverse of a split: two sibling leaf postings
+    # whose combined live occupancy is small are replaced by one.  The policy
+    # is deliberately narrow so it never fights the split path:
+    #
+    #   * trigger   — a posting is underfilled when its live owned count is
+    #                 strictly below ``effective_merge_threshold`` (replicas in
+    #                 ``members`` never count).  Merges run only after a delete.
+    #   * candidates— same parent in the *current* hierarchy (all leaves share
+    #                 an implicit root at depth 1); at least one underfilled;
+    #                 combined live owned <= split_threshold (hysteresis).
+    #   * partner   — smallest Ward merge cost ``n_A n_B/(n_A+n_B)||μ_A-μ_B||²``
+    #                 over live owned means (the k-means objective), ties by the
+    #                 lower posting id.  Stored centroids are not used to rank.
+    #   * survivor  — the lower posting id keeps the merged centroid.
+    #
+    # Ownership is then repaired with the same sound ball bound the split path
+    # uses (only the merged centroid is a new competitor for an unchanged
+    # posting), replica membership is re-derived from the final centroids with
+    # the production fixed-Δ pass, and empty leaves are pruned.
+
+    def _effective_merge_threshold(self) -> int:
+        """Underflow threshold; see ``MaintainConfig.merge_threshold``."""
+        mt = self._cfg_maintain.merge_threshold
+        if mt is not None:
+            return int(mt)
+        return max(1, self._cfg_maintain.split_threshold // 2)
+
+    def _dead_array(self) -> np.ndarray | None:
+        dead = self._tombstones | self._segment.tombstones
+        if not dead:
+            return None
+        return np.array(sorted(dead), dtype=np.int64)
+
+    def _live_owned(self, p: Posting) -> np.ndarray:
+        """A posting's canonical owned ids with tombstones removed."""
+        dead = self._dead_array()
+        if dead is None:
+            return p.owned
+        return p.owned[~np.isin(p.owned, dead)].astype(np.int64)
+
+    def _leaf_parent_of(self) -> dict[int, int]:
+        """Map every leaf index to its parent node id in the level above it.
+
+        Returns an empty dict for depth 1, where there is no routing level and
+        every leaf is a child of the implicit root (all leaves are siblings).
+        """
+        levels = self._segment.levels
+        if len(levels) <= 1:
+            return {}
+        parent_of: dict[int, int] = {}
+        for node, children in enumerate(levels[-2].children):
+            for child in children.tolist():
+                parent_of[int(child)] = node
+        return parent_of
+
+    def _select_merge_pair(self) -> tuple[int, int] | None:
+        """Deterministic (survivor, removed) pair, or None if no pair is eligible."""
+        postings = self._segment.postings
+        K = len(postings)
+        if K < 2:
+            return None
+
+        threshold = self._effective_merge_threshold()
+        split_threshold = self._cfg_maintain.split_threshold
+        counts = np.array([len(self._live_owned(p)) for p in postings], dtype=np.int64)
+        underfilled = counts < threshold
+        if not underfilled.any():
+            return None
+
+        parent_of = self._leaf_parent_of()
+        means: list[np.ndarray | None] = [None] * K
+        for i in range(K):
+            if counts[i] > 0:
+                means[i] = self._vectors[self._live_owned(postings[i])].astype(
+                    np.float32
+                ).mean(axis=0)
+
+        best_key: tuple[float, int, int] | None = None
+        best_pair: tuple[int, int] | None = None
+        examined = 0
+        for a in range(K):
+            for b in range(a + 1, K):
+                if not (underfilled[a] or underfilled[b]):
+                    continue
+                if parent_of:
+                    pa, pb = parent_of.get(a), parent_of.get(b)
+                    if pa is None or pa != pb:
+                        continue
+                if int(counts[a] + counts[b]) > split_threshold:
+                    continue
+                examined += 1
+                n_a, n_b = int(counts[a]), int(counts[b])
+                if n_a == 0 or n_b == 0:
+                    # An empty posting has no mean; treat its merge cost as 0 so
+                    # the empty leaf is removed without a division by zero.
+                    cost = 0.0
+                else:
+                    diff = means[a] - means[b]
+                    cost = (n_a * n_b / (n_a + n_b)) * float(np.dot(diff, diff))
+                key = (cost, a, b)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_pair = (a, b)
+
+        self._counters.merge_candidates_examined += examined
+        return best_pair
+
+    def _remove_leaf(self, remove_pid: int) -> None:
+        """Drop one leaf posting and its centroid row, preserving leaf order.
+
+        Posting ids are positional (``postings[i].id == i`` and leaf-centroid row
+        ``i``): the remaining postings are renumbered in order so the invariant
+        holds.  The upper routing levels are left stale on purpose — callers must
+        rebuild them (``_rebuild_hierarchy``) once all removals are done.
+        """
+        postings = self._segment.postings
+        keep = [i for i in range(len(postings)) if i != remove_pid]
+        self._segment.postings = [
+            Posting(new_id, postings[old].centroid,
+                    postings[old].members, postings[old].owned)
+            for new_id, old in enumerate(keep)
+        ]
+        leaf = self._segment.levels[-1]
+        leaf.centroids = np.ascontiguousarray(
+            leaf.centroids[np.array(keep, dtype=np.int64)]
+        ).astype(np.float32)
+        self._spread = [self._spread[old] for old in keep]
+
+    def _recompute_all_spreads(self) -> None:
+        """Refresh every posting's bounding radius from its live owned set."""
+        for pid, p in enumerate(self._segment.postings):
+            self._spread[pid] = _owned_spread(self._vectors, p.centroid, p.owned)
+
+    def _merge_after_delete(self) -> None:
+        """Run the merge path to a fixed point, or restore state on failure.
+
+        The whole sequence (merges, any oversize split, empty-leaf pruning, final
+        membership) is atomic: the segment, tombstones, spreads and counters are
+        snapshotted first, and any exception rolls them back so a half-applied
+        merge is never observable.
+        """
+        postings = self._segment.postings
+        if len(postings) < 2:
+            return
+        threshold = self._effective_merge_threshold()
+        if not any(len(self._live_owned(p)) < threshold for p in postings):
+            return
+
+        saved_segment = self._segment.clone()
+        saved_tombstones = set(self._tombstones)
+        saved_spread = list(self._spread)
+        saved_counters = self._counters.snapshot()
+        try:
+            max_merges = len(self._segment.postings)
+            n_merges = 0
+            while len(self._segment.postings) > 1:
+                pair = self._select_merge_pair()
+                if pair is None:
+                    break
+                self._merge_pair(pair[0], pair[1])
+                n_merges += 1
+                if n_merges > max_merges:
+                    raise RuntimeError(
+                        "in-place merge loop failed to make progress"
+                    )
+
+            if n_merges == 0:
+                return  # underflow existed but no sibling was eligible
+
+            if self._has_oversize_posting():
+                self._split_oversize()
+            self._prune_empty_leaves()
+            self._recompute_all_spreads()
+            self._recompute_membership()
+        except Exception:
+            self._segment = saved_segment
+            self._tombstones = saved_tombstones
+            self._spread = saved_spread
+            for name, value in vars(saved_counters).items():
+                setattr(self._counters, name, value)
+            raise
+
+    def _merge_pair(self, pid_a: int, pid_b: int) -> None:
+        """Structurally merge two eligible leaves; ``pid_a`` is the survivor."""
+        if pid_a > pid_b:
+            pid_a, pid_b = pid_b, pid_a
+        postings = self._segment.postings
+        p_a, p_b = postings[pid_a], postings[pid_b]
+
+        a_live = self._live_owned(p_a)
+        b_live = self._live_owned(p_b)
+        selected = np.unique(np.concatenate([a_live, b_live])).astype(np.int64)
+
+        if len(selected) > 0:
+            # Mean of the union's live vectors — the same k-means centroid the
+            # construction/split paths use (no re-normalisation, float32).
+            new_centroid = self._vectors[selected].astype(np.float32).mean(
+                axis=0
+            ).astype(np.float32)
+        else:
+            # Both leaves fully tombstoned: no live mean exists.  Keep the
+            # survivor's centroid so the row stays well defined; the empty leaf
+            # is removed by pruning.
+            new_centroid = p_a.centroid.astype(np.float32)
+
+        self._segment.levels[-1].centroids[pid_a] = new_centroid
+        postings[pid_a] = Posting(pid_a, new_centroid, a_live, a_live)
+
+        self._remove_leaf(pid_b)
+        self._counters.merge_hierarchy_rebuilds += 1
+        self._rebuild_hierarchy()
+
+        self._reassign_after_merge(pid_a, selected)
+        self._counters.merges += 1
+
+    def _reassign_after_merge(self, merged_pid: int, selected: np.ndarray) -> None:
+        """Restore canonical ownership after a merge, then refresh spreads.
+
+        Soundness mirrors the split repair: the merge changed exactly one leaf
+        centroid (the survivor's) and removed one.  Every other posting centroid
+        is unchanged, and the index satisfied NPA before the merge, so a vector
+        owned by an unchanged posting can only lose ownership to the merged
+        centroid.  The per-posting spread bound screens which unchanged postings
+        that can happen to; the final owner of every contested vector is decided
+        by a full ``np.argmax`` scan over the resulting leaf centroids (ties →
+        lowest posting id).
+        """
+        postings = self._segment.postings
+        leaf = self._segment.levels[-1].centroids
+        K = len(leaf)
+        merged_c = leaf[merged_pid].astype(np.float32)
+        norms_sq = np.einsum("ij,ij->i", leaf, leaf)
+        merged_norm_sq = float(norms_sq[merged_pid])
+        sims_merged_vs_leaf = sim_one_to_many(
+            merged_c, leaf, self._counters, "build"
+        )
+        n_sim = len(leaf)
+
+        screen: list[int] = []
+        for c in range(K):
+            if c == merged_pid:
+                continue
+            r_c = self._spread[c]
+            d_sq = max(
+                0.0,
+                float(norms_sq[c] + merged_norm_sq
+                      - 2.0 * float(sims_merged_vs_leaf[c])),
+            )
+            if _ball_may_switch(
+                float(sims_merged_vs_leaf[c]), float(norms_sq[c]), r_c, d_sq
+            ):
+                screen.append(c)
+
+        new_owned: dict[int, list[int]] = {pid: [] for pid in range(K)}
+        for c in range(K):
+            if c == merged_pid or c in screen:
+                continue
+            new_owned[c] = self._live_owned(postings[c]).tolist()
+
+        old_owner: dict[int, int] = {}
+        for c in range(K):
+            for v in postings[c].owned.tolist():
+                old_owner[int(v)] = c
+
+        # Vectors formerly owned by either merged posting: their old centroid no
+        # longer exists, so every leaf is a legal winner.
+        if len(selected) > 0:
+            X_sel = self._vectors[selected].astype(np.float32)
+            sims = sim_many_to_many(X_sel, leaf, self._counters, "build")
+            n_sim += len(selected) * K
+            owners = np.argmax(sims, axis=1)
+            for vid, owner in zip(selected.tolist(), owners.tolist()):
+                new_owned[int(owner)].append(int(vid))
+
+        # Vectors of potentially-affected unchanged postings: only the merged
+        # centroid can newly beat their owner, so a two-centroid compare decides
+        # who is contested and a full scan decides the contested final owners.
+        for c in screen:
+            owned_c = self._live_owned(postings[c])
+            if len(owned_c) == 0:
+                continue
+            X_c = self._vectors[owned_c].astype(np.float32)
+            own_sim = sim_one_to_many(leaf[c], X_c, self._counters, "build")
+            sim_merged = sim_one_to_many(merged_c, X_c, self._counters, "build")
+            n_sim += 2 * len(owned_c)
+            contested = sim_merged >= own_sim
+            kept = owned_c[~contested]
+            new_owned[c].extend(int(v) for v in kept.tolist())
+            if contested.any():
+                X_con = X_c[contested]
+                sims = sim_many_to_many(X_con, leaf, self._counters, "build")
+                n_sim += len(X_con) * K
+                owners = np.argmax(sims, axis=1)
+                for vid, owner in zip(
+                    owned_c[contested].tolist(), owners.tolist()
+                ):
+                    new_owned[int(owner)].append(int(vid))
+
+        n_reassigned = 0
+        for pid in range(K):
+            arr = np.array(sorted(set(new_owned[pid])), dtype=np.int64)
+            for v in arr.tolist():
+                if old_owner.get(int(v), -1) != pid:
+                    n_reassigned += 1
+            p = postings[pid]
+            # `members` is re-derived from the final centroid layout by the
+            # caller's membership pass; setting it to `owned` in the interim
+            # keeps `owned ⊆ members` true and never leaves a stale replica.
+            postings[pid] = Posting(pid, p.centroid, arr, arr)
+
+        self._counters.merge_vectors_reassigned += n_reassigned
+        self._counters.merge_similarity_evaluations += n_sim
+        self._recompute_all_spreads()
+
+    def _has_oversize_posting(self) -> bool:
+        threshold = self._cfg_maintain.split_threshold
+        return any(
+            len(self._live_owned(p)) > threshold for p in self._segment.postings
+        )
+
+    def _split_oversize(self) -> None:
+        """Split postings pushed over ``split_threshold`` by reassignment.
+
+        Best-effort and terminating: each over-threshold posting is split at
+        most once.  A split can fail to reduce a posting whose live owned set
+        does not partition cleanly (e.g. interleaved vectors produce two nearly
+        coincident k-means centroids, after which ``argmax`` ownership sends
+        every vector back to one of them).  Repeating the split on the same
+        posting would then append empty leaves forever, so it is attempted once;
+        a posting the split cannot divide is left over-threshold (still correct)
+        and the empty leaf the attempt created is removed by
+        ``_prune_empty_leaves``.
+        """
+        threshold = self._cfg_maintain.split_threshold
+        attempted: set[int] = set()
+        while True:
+            candidate = next(
+                (
+                    i for i, p in enumerate(self._segment.postings)
+                    if i not in attempted
+                    and len(self._live_owned(p)) > threshold
+                ),
+                None,
+            )
+            if candidate is None:
+                break
+            attempted.add(candidate)
+            self._split(candidate)
+
+    def _prune_empty_leaves(self) -> None:
+        """Remove leaves that own no live vector, keeping at least one posting.
+
+        Relative leaf order is preserved by `_remove_leaf`'s in-order
+        compaction, so the tie order of the surviving postings is unchanged.
+        Removing an empty posting can only help NPA (a competitor disappears);
+        membership is re-derived afterwards.
+        """
+        removed = False
+        while len(self._segment.postings) > 1:
+            empties = [
+                i for i, p in enumerate(self._segment.postings)
+                if len(self._live_owned(p)) == 0
+            ]
+            if not empties:
+                break
+            self._remove_leaf(empties[0])
+            removed = True
+        if removed:
+            self._rebuild_hierarchy()

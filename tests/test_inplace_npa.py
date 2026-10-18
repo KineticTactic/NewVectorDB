@@ -330,7 +330,11 @@ def test_auditor_excludes_tombstoned_vectors():
     seg = maint._segment
 
     victim = VID_DISTRACTORS[0]
-    maint.delete(victim)
+    # Tombstone directly (rather than via ``delete``) so the eager merge path
+    # cannot fire and collapse postings before the ownership is re-attached.
+    # This test is about the auditor's tombstone filtering, not about merges.
+    maint._tombstones.add(victim)
+    seg.mark_deleted(victim)
     assert victim in seg.tombstones
 
     # Re-attach the deleted vector to the far posting.  If tombstoned vectors

@@ -55,6 +55,12 @@ class MaintainConfig:
     # per-posting bounding radius. Kept so existing configs/sweeps still load.
     n_reassign_neighbours: int = 8
     tombstone_rebuild_frac: float = 0.2  # in-place: rebuild posting fraction
+    # In-place posting-merge underflow trigger. A posting whose live canonical
+    # owned count is strictly below this value becomes merge-eligible after a
+    # delete. None → derive as max(1, split_threshold // 2), i.e. half the split
+    # threshold, which keeps merges from immediately re-splitting. Replicas in
+    # `members` never count toward occupancy.
+    merge_threshold: int | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

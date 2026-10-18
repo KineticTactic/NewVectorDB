@@ -40,6 +40,17 @@ class Counters:
     flushes: int = 0
     forced_checkpoint_flushes: int = 0
     hierarchy_rebuilds: int = 0
+    # ---- posting merges (in-place underflow maintenance) ------------------
+    # `merges` is incremented only after a structural merge completes;
+    # `merge_candidates_examined` counts eligible pairs scored for cost;
+    # `merge_vectors_reassigned` counts canonical owners that changed;
+    # `merge_similarity_evaluations` counts merge-time repair similarities;
+    # `merge_hierarchy_rebuilds` counts hierarchy rebuilds caused by a merge.
+    merges: int = 0
+    merge_candidates_examined: int = 0
+    merge_vectors_reassigned: int = 0
+    merge_similarity_evaluations: int = 0
+    merge_hierarchy_rebuilds: int = 0
 
     # -----------------------------------------------------------------------
 
@@ -84,6 +95,11 @@ class Counters:
             "flushes": self.flushes,
             "forced_checkpoint_flushes": self.forced_checkpoint_flushes,
             "hierarchy_rebuilds": self.hierarchy_rebuilds,
+            "merges": self.merges,
+            "merge_candidates_examined": self.merge_candidates_examined,
+            "merge_vectors_reassigned": self.merge_vectors_reassigned,
+            "merge_similarity_evaluations": self.merge_similarity_evaluations,
+            "merge_hierarchy_rebuilds": self.merge_hierarchy_rebuilds,
         }
 
     def to_dict(self) -> dict:
@@ -113,4 +129,9 @@ class Counters:
         c.flushes += other.flushes
         c.forced_checkpoint_flushes += other.forced_checkpoint_flushes
         c.hierarchy_rebuilds += other.hierarchy_rebuilds
+        c.merges += other.merges
+        c.merge_candidates_examined += other.merge_candidates_examined
+        c.merge_vectors_reassigned += other.merge_vectors_reassigned
+        c.merge_similarity_evaluations += other.merge_similarity_evaluations
+        c.merge_hierarchy_rebuilds += other.merge_hierarchy_rebuilds
         return c
