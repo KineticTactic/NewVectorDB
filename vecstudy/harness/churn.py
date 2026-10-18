@@ -558,7 +558,11 @@ def audit_membership(
             continue
         owner_pid = owner_pids[0]
 
-        sims = centroids @ seg.vectors[vid].astype(np.float32)
+        # float64 accumulation: the ratio below is d2/d1 - 1 with d = 1 - sim,
+        # so a float32 similarity would lose the small distance to cancellation
+        # and make the boundary test unreliable.  This stays an inline
+        # independent computation — it never calls a production helper.
+        sims = centroids.astype(np.float64) @ seg.vectors[vid].astype(np.float64)
         expected = _expected_membership(sims, owner_pid, delta)
         actual = sorted(set(members_of.get(vid, [])))
 

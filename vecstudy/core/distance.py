@@ -83,6 +83,58 @@ def sim_many_to_many(
     return A @ B.T   # (M, D) @ (D, N) → (M, N)
 
 
+# ---------------------------------------------------------------------------
+# float64 kernels for the fixed-Δ relative-distance statistic
+# ---------------------------------------------------------------------------
+#
+# When a vector sits very close to a centroid, similarity is close to 1 and the
+# distance ``d = 1 - sim`` loses the leading digits of ``sim`` to cancellation:
+# at ``sim ~ 1 - 1e-4`` a float32 input carries a relative error of ~1e-3 in
+# ``d``.  The fixed-Δ rule compares the *ratio* ``d2/d1 - 1`` against Δ, so that
+# cancellation can flip the decision for a vector genuinely near the boundary.
+#
+# These variants promote the operands to float64 *before* the dot product, so
+# the accumulated similarity keeps float64 precision and ``1 - sim`` is accurate
+# to ~1e-12 relative.  They are used only where the Δ membership decision is
+# taken; the query kernels above stay float32 so routing/scan behaviour and cost
+# are unchanged.
+
+def sim_one_to_many_f64(
+    q: np.ndarray,
+    X: np.ndarray,
+    counters: Counters,
+    bucket: str,
+) -> np.ndarray:
+    """float64 variant of :func:`sim_one_to_many` (operands promoted pre-dot).
+
+    Inputs are the same stored float32 data; only the accumulation is float64.
+    Distinct posting ids still resolve ties by the caller's stable argmax.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    n = X.shape[0]
+    if n == 0:
+        return np.empty(0, dtype=np.float64)
+    counters.add_distance(bucket, n)
+    return X @ q
+
+
+def sim_many_to_many_f64(
+    A: np.ndarray,
+    B: np.ndarray,
+    counters: Counters,
+    bucket: str,
+) -> np.ndarray:
+    """float64 variant of :func:`sim_many_to_many` (operands promoted pre-dot)."""
+    A = np.asarray(A, dtype=np.float64)
+    B = np.asarray(B, dtype=np.float64)
+    m, n = A.shape[0], B.shape[0]
+    if m == 0 or n == 0:
+        return np.empty((m, n), dtype=np.float64)
+    counters.add_distance(bucket, m * n)
+    return A @ B.T
+
+
 def dist_one_to_many(
     q: np.ndarray,
     X: np.ndarray,

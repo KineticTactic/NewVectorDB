@@ -16,7 +16,12 @@ import numpy as np
 from ..core.types import VectorId, Posting
 from ..core.config import IndexConfig, MaintainConfig
 from ..core.metrics import Counters
-from ..core.distance import sim_one_to_many, sim_many_to_many
+from ..core.distance import (
+    sim_one_to_many,
+    sim_many_to_many,
+    sim_one_to_many_f64,
+    sim_many_to_many_f64,
+)
 from ..core.clustering import balanced_kmeans
 from ..index.hierarchy import build_hierarchy, _stable_top_k
 from ..index.postings import posting_add_vector
@@ -247,7 +252,15 @@ class InPlaceMaintainer(IndexMaintainer):
         leaf_level = self._segment.levels[-1]
         sims = sim_one_to_many(vec, leaf_level.centroids, self._counters, "routing")
         pid = int(_stable_top_k(-sims, 1)[0])
-        replica_pid = self._replica_target(sims, pid)
+        # The Δ decision subtracts from 1, so it is taken on a float64 similarity
+        # (see `sim_one_to_many_f64`); the float32 scores above still pick the
+        # canonical owner, so routing/ownership behaviour is unchanged.
+        replica_pid = None
+        if self._cfg_index.delta is not None:
+            sims_mem = sim_one_to_many_f64(
+                vec, leaf_level.centroids, self._counters, "routing"
+            )
+            replica_pid = self._replica_target(sims_mem, pid)
 
         p = posting_add_vector(self._segment.postings[pid], vid, owned=True)
         self._segment.postings[pid] = p
@@ -580,7 +593,7 @@ class InPlaceMaintainer(IndexMaintainer):
         member_lists: list[list[int]] = [[] for _ in postings]
         for start in range(0, len(live), MEMBERSHIP_CHUNK):
             chunk = live[start:start + MEMBERSHIP_CHUNK]
-            sims = sim_many_to_many(
+            sims = sim_many_to_many_f64(
                 self._vectors[chunk].astype(np.float32),
                 leaf_centroids,
                 self._counters,

@@ -14,7 +14,7 @@ import numpy as np
 
 from ..core.types import Posting, PostingId, VectorId
 from ..core.metrics import Counters
-from ..core.distance import sim_many_to_many
+from ..core.distance import sim_many_to_many_f64
 
 POSTING_HEADER_BYTES = 64
 
@@ -43,14 +43,15 @@ def assign(
 
     nearest = np.empty(N, dtype=np.int64)
     second  = np.empty(N, dtype=np.int64)
-    sim1    = np.empty(N, dtype=np.float32)
-    sim2    = np.empty(N, dtype=np.float32)
+    sim1    = np.empty(N, dtype=np.float64)
+    sim2    = np.empty(N, dtype=np.float64)
 
     for start in range(0, N, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, N)
         X_chunk = X[start:end]
-        # sim_many_to_many counts distances correctly per chunk
-        sims_chunk = sim_many_to_many(X_chunk, centroids, counters, "build")  # (chunk, K)
+        # float64 similarity: the Δ decision below subtracts this from 1, so a
+        # float32 result would lose the leading digits of a small distance.
+        sims_chunk = sim_many_to_many_f64(X_chunk, centroids, counters, "build")  # (chunk, K)
 
         if K >= 2:
             top2 = np.argpartition(-sims_chunk, kth=1, axis=1)[:, :2]
@@ -71,8 +72,10 @@ def assign(
             sim1[start:end] = sims_chunk[:, 0]
             sim2[start:end] = sims_chunk[:, 0]
 
-    d1 = (1.0 - sim1).astype(np.float64)
-    d2 = (1.0 - sim2).astype(np.float64)
+    # Clamp to zero: 1 - sim can dip a hair below zero on float round-off, and
+    # the documented policy clamps negative distances before the ratio test.
+    d1 = np.maximum(1.0 - sim1, 0.0)
+    d2 = np.maximum(1.0 - sim2, 0.0)
 
     owned_lists:   list[list[int]] = [[] for _ in range(K)]
     members_lists: list[list[int]] = [[] for _ in range(K)]
@@ -87,7 +90,13 @@ def assign(
             if d2[vid] <= d1[vid] * (1.0 + delta):
                 add_replica = True
                 if rng_rule:
-                    cc_dist = float(1.0 - np.dot(centroids[c1], centroids[c2]))
+                    cc_dist = max(
+                        1.0 - float(
+                            np.dot(centroids[c1].astype(np.float64),
+                                   centroids[c2].astype(np.float64))
+                        ),
+                        0.0,
+                    )
                     if cc_dist < d2[vid]:
                         add_replica = False
                 if add_replica:
