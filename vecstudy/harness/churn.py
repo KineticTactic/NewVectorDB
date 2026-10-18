@@ -331,23 +331,36 @@ def audit_maintainer(
 
     elif isinstance(maint, OutOfPlaceMaintainer):
         # Sealed segments: NPA is checked within each sealed segment.
-        all_live_found: set[int] = set()
+        global_owner_count: dict[int, list[str]] = {}
         for s_idx, seg in enumerate(maint._sealed):
             v, o, live_owned, n_postings = _audit_segment_npa(
                 seg, seg.tombstones | maint._tombstones, tolerance, s_idx
             )
             npa_violations.extend(v)
             ownership_errors.extend(o)
-            all_live_found.update(live_owned)
+            for vi in live_owned:
+                global_owner_count.setdefault(vi, []).append(f"sealed[{s_idx}]")
             postings_checked += n_postings
 
         # MemTable entries
         memtable_postings = 0
+        memtable_counts: dict[int, int] = {}
         for vid in maint._memtable:
             vi = int(vid)
             if vi not in maint._tombstones:
-                all_live_found.add(vi)
+                memtable_counts[vi] = memtable_counts.get(vi, 0) + 1
+                global_owner_count.setdefault(vi, []).append("memtable")
                 memtable_postings = 1
+
+        for vi, count in memtable_counts.items():
+            if count > 1:
+                ownership_errors.append(f"vid {vi} duplicated {count} times in memtable")
+
+        for vi, locations in global_owner_count.items():
+            if len(locations) > 1:
+                ownership_errors.append(f"vid {vi} has multiple owners across units: {locations}")
+
+        all_live_found = set(global_owner_count)
         postings_checked += memtable_postings
         live_vectors_checked = len(all_live_found)
 
@@ -486,11 +499,99 @@ def _expected_membership(
     return (owner_pid, other) if qualifies else (owner_pid,)
 
 
+def _audit_segment_membership(
+    seg: Segment,
+    tombstones: set[int],
+    delta: float | None,
+    segment_prefix: str = "",
+) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], int, int]:
+    centroids = seg.levels[-1].centroids
+    owners: dict[int, list[int]] = {}
+    members_of: dict[int, list[int]] = {}
+    duplicates: list[dict] = []
+    dead_members: list[dict] = []
+
+    for p in seg.postings:
+        counts: dict[int, int] = {}
+        for vid in p.members.tolist():
+            v = int(vid)
+            counts[v] = counts.get(v, 0) + 1
+            members_of.setdefault(v, []).append(int(p.id))
+            if v in tombstones:
+                rec = {"vid": v, "pid": int(p.id)}
+                if segment_prefix:
+                    rec["segment"] = segment_prefix
+                dead_members.append(rec)
+        for v, c in sorted(counts.items()):
+            if c > 1:
+                rec = {"vid": v, "pid": int(p.id), "count": c}
+                if segment_prefix:
+                    rec["segment"] = segment_prefix
+                duplicates.append(rec)
+        for vid in p.owned.tolist():
+            v = int(vid)
+            if v in tombstones:
+                continue
+            owners.setdefault(v, []).append(int(p.id))
+
+    missing: list[dict] = []
+    extra: list[dict] = []
+    missing_from_owner: list[dict] = []
+    ownership_conflicts: list[dict] = []
+
+    for vid in sorted(owners):
+        owner_pids = owners[vid]
+        if len(owner_pids) != 1:
+            rec = {"vid": vid, "owner_pids": owner_pids}
+            if segment_prefix:
+                rec["segment"] = segment_prefix
+            ownership_conflicts.append(rec)
+            continue
+        owner_pid = owner_pids[0]
+
+        # float64 accumulation: the ratio below is d2/d1 - 1 with d = 1 - sim
+        sims = centroids.astype(np.float64) @ seg.vectors[vid].astype(np.float64)
+        expected = _expected_membership(sims, owner_pid, delta)
+        actual = sorted(set(members_of.get(vid, [])))
+
+        missing_pids = [pid for pid in expected if pid not in actual]
+        extra_pids = [pid for pid in actual if pid not in expected]
+        if missing_pids:
+            rec = {
+                "vid": vid, "owner_pid": owner_pid,
+                "expected_pids": list(expected), "actual_pids": actual,
+                "missing_pids": missing_pids,
+            }
+            if segment_prefix:
+                rec["segment"] = segment_prefix
+            missing.append(rec)
+        if extra_pids:
+            rec = {
+                "vid": vid, "owner_pid": owner_pid,
+                "expected_pids": list(expected), "actual_pids": actual,
+                "extra_pids": extra_pids,
+            }
+            if segment_prefix:
+                rec["segment"] = segment_prefix
+            extra.append(rec)
+        if owner_pid not in members_of.get(vid, []):
+            rec = {"vid": vid, "owner_pid": owner_pid}
+            if segment_prefix:
+                rec["segment"] = segment_prefix
+            missing_from_owner.append(rec)
+
+    return (
+        missing, extra, duplicates, missing_from_owner, dead_members,
+        ownership_conflicts, len(owners), len(seg.postings),
+    )
+
+
 def audit_membership(
     maint: IndexMaintainer,
     delta_override: object = _UNSET,
+    allow_outofplace: bool = False,
 ) -> MembershipAuditResult:
-    """Independently verify fixed-Δ replica membership for an in-place index.
+    """Independently verify fixed-Δ replica membership for in-place and out-of-place indexes.
 
     Expected membership is derived only from the current live leaf centroids,
     the current canonical owner (read from ``owned``) and the configured Δ —
@@ -510,7 +611,13 @@ def audit_membership(
     default the maintainer's configured Δ is used, which is the contract the
     index is supposed to satisfy.
     """
-    if not isinstance(maint, InPlaceMaintainer):
+    if isinstance(maint, OutOfPlaceMaintainer):
+        if not allow_outofplace:
+            raise TypeError(
+                "fixed-Δ membership is maintained by InPlaceMaintainer only; "
+                f"got {type(maint).__name__}"
+            )
+    elif not isinstance(maint, InPlaceMaintainer):
         raise TypeError(
             "fixed-Δ membership is maintained by InPlaceMaintainer only; "
             f"got {type(maint).__name__}"
@@ -520,77 +627,76 @@ def audit_membership(
         if delta_override is _UNSET
         else delta_override
     )
-    seg = maint._segment
-    tombstones = set(seg.tombstones) | set(getattr(maint, "_tombstones", set()))
-    centroids = seg.levels[-1].centroids
 
-    owners: dict[int, list[int]] = {}
-    members_of: dict[int, list[int]] = {}
-    duplicates: list[dict] = []
-    dead_members: list[dict] = []
+    if isinstance(maint, InPlaceMaintainer):
+        seg = maint._segment
+        tombstones = set(seg.tombstones) | set(getattr(maint, "_tombstones", set()))
+        res = _audit_segment_membership(seg, tombstones, delta)
+        return MembershipAuditResult(
+            missing=res[0],
+            extra=res[1],
+            duplicates=res[2],
+            missing_from_owner=res[3],
+            dead_members=res[4],
+            ownership_conflicts=res[5],
+            live_vectors_checked=res[6],
+            postings_checked=res[7],
+        )
 
-    for p in seg.postings:
-        counts: dict[int, int] = {}
-        for vid in p.members.tolist():
-            v = int(vid)
-            counts[v] = counts.get(v, 0) + 1
-            members_of.setdefault(v, []).append(int(p.id))
-            if v in tombstones:
-                dead_members.append({"vid": v, "pid": int(p.id)})
-        for v, c in sorted(counts.items()):
+    # OutOfPlaceMaintainer
+    all_missing: list[dict] = []
+    all_extra: list[dict] = []
+    all_duplicates: list[dict] = []
+    all_missing_from_owner: list[dict] = []
+    all_dead_members: list[dict] = []
+    all_ownership_conflicts: list[dict] = []
+    total_live = 0
+    total_postings = 0
+
+    global_tombstones = set(maint._tombstones)
+    for s_idx, seg in enumerate(maint._sealed):
+        tombstones = set(seg.tombstones) | global_tombstones
+        res = _audit_segment_membership(seg, tombstones, delta, segment_prefix=f"sealed[{s_idx}]")
+        all_missing.extend(res[0])
+        all_extra.extend(res[1])
+        all_duplicates.extend(res[2])
+        all_missing_from_owner.extend(res[3])
+        all_dead_members.extend(res[4])
+        all_ownership_conflicts.extend(res[5])
+        total_live += res[6]
+        total_postings += res[7]
+
+    # MemTable check: flat buffer has no replicas
+    if maint._memtable:
+        mem_counts: dict[int, int] = {}
+        for vid in maint._memtable:
+            vi = int(vid)
+            if vi in global_tombstones:
+                all_dead_members.append({"vid": vi, "unit": "memtable"})
+            else:
+                mem_counts[vi] = mem_counts.get(vi, 0) + 1
+        for vi, c in sorted(mem_counts.items()):
             if c > 1:
-                duplicates.append({"vid": v, "pid": int(p.id), "count": c})
-        for vid in p.owned.tolist():
-            v = int(vid)
-            if v in tombstones:
-                continue
-            owners.setdefault(v, []).append(int(p.id))
-
-    missing: list[dict] = []
-    extra: list[dict] = []
-    missing_from_owner: list[dict] = []
-    ownership_conflicts: list[dict] = []
-
-    for vid in sorted(owners):
-        owner_pids = owners[vid]
-        if len(owner_pids) != 1:
-            ownership_conflicts.append({"vid": vid, "owner_pids": owner_pids})
-            continue
-        owner_pid = owner_pids[0]
-
-        # float64 accumulation: the ratio below is d2/d1 - 1 with d = 1 - sim,
-        # so a float32 similarity would lose the small distance to cancellation
-        # and make the boundary test unreliable.  This stays an inline
-        # independent computation — it never calls a production helper.
-        sims = centroids.astype(np.float64) @ seg.vectors[vid].astype(np.float64)
-        expected = _expected_membership(sims, owner_pid, delta)
-        actual = sorted(set(members_of.get(vid, [])))
-
-        missing_pids = [pid for pid in expected if pid not in actual]
-        extra_pids = [pid for pid in actual if pid not in expected]
-        if missing_pids:
-            missing.append({
-                "vid": vid, "owner_pid": owner_pid,
-                "expected_pids": list(expected), "actual_pids": actual,
-                "missing_pids": missing_pids,
-            })
-        if extra_pids:
-            extra.append({
-                "vid": vid, "owner_pid": owner_pid,
-                "expected_pids": list(expected), "actual_pids": actual,
-                "extra_pids": extra_pids,
-            })
-        if owner_pid not in members_of.get(vid, []):
-            missing_from_owner.append({"vid": vid, "owner_pid": owner_pid})
+                all_duplicates.append({"vid": vi, "unit": "memtable", "count": c})
+        total_live += len(mem_counts)
+        total_postings += 1
 
     return MembershipAuditResult(
-        missing=missing,
-        extra=extra,
-        duplicates=duplicates,
-        missing_from_owner=missing_from_owner,
-        dead_members=dead_members,
-        ownership_conflicts=ownership_conflicts,
-        live_vectors_checked=len(owners),
-        postings_checked=len(seg.postings),
+        missing=all_missing,
+        extra=all_extra,
+        duplicates=all_duplicates,
+        missing_from_owner=all_missing_from_owner,
+        dead_members=all_dead_members,
+        ownership_conflicts=all_ownership_conflicts,
+        live_vectors_checked=total_live,
+        postings_checked=total_postings,
     )
+
+
+def audit_outofplace_membership(
+    maint: OutOfPlaceMaintainer,
+    delta_override: object = _UNSET,
+) -> MembershipAuditResult:
+    """Audit fixed-Δ replica membership for OutOfPlaceMaintainer across sealed segments."""
+    return audit_membership(maint, delta_override=delta_override, allow_outofplace=True)
 

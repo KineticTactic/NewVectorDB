@@ -116,6 +116,9 @@ class OutOfPlaceMaintainer(IndexMaintainer):
             "vectors_reclustered": self._counters.vectors_reclustered,
             "flushes": self._counters.flushes,
             "hierarchy_rebuilds": self._counters.hierarchy_rebuilds,
+            "replicas_added": self._counters.replicas_added,
+            "replicas_removed": self._counters.replicas_removed,
+            "membership_vectors_recomputed": self._counters.membership_vectors_recomputed,
             "tombstones": len(self._tombstones),
         }
 
@@ -143,6 +146,8 @@ class OutOfPlaceMaintainer(IndexMaintainer):
         )
         self._sealed.append(seg)
         self._counters.flushes += 1
+        replicas_in_seg = sum(len(p.members) - len(p.owned) for p in seg.postings)
+        self._counters.replicas_added += replicas_in_seg
 
     def _compact(self) -> None:
         """Union live vectors across all sealed segments; re-cluster from scratch.
