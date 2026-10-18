@@ -246,12 +246,17 @@ class IndexMaintainer(ABC):
     def stats(self) -> dict: ...
 ```
 
-**Out-of-place (`outofplace.py`)** — build this one first, it is simpler.
+**Out-of-place (`outofplace.py`)** — LSM-Vec-style log-structured maintenance.
 
-- Buffer inserts in a MemTable (flat list, exhaustively scanned at query time; it is one searchable unit).
-- At `memtable_limit` vectors, cluster the buffer and flush it as a new sealed `Segment` with its own hierarchy.
-- At `m` sealed segments, compact: union their live vectors, re-cluster from scratch, emit one segment.
-- Record `compaction_events`, `vectors_reclustered`, and the segment count over time.
+- **Zero-distance insert path:** Buffer incoming vectors into an in-memory MemTable (flat vector list, scored exhaustively at query time as a flat searchable unit). No hierarchy traversal is performed on insert ($O(1)$ write cost, 0 distance evaluations).
+- **Batch flushing:** When the MemTable reaches `memtable_limit`, live vectors are clustered into a new sealed immutable `Segment` with complete hierarchy levels and fixed-Δ replicas. Any deleted vectors that were buffered in the MemTable are cleared from tombstones upon sealing.
+- **Dual compaction triggers:** Compaction is triggered when the sealed segment count reaches `compaction_threshold` (read amplification mitigation) OR when the global tombstone ratio across sealed segments exceeds `tombstone_rebuild_frac` (deletion-driven storage reclamation).
+- **Atomic compaction with rollback:** Unions live vectors across all sealed segments (`is_alive(vid) and vid not in _tombstones`), re-clusters from scratch, builds a consolidated segment, and replaces the sealed segment list. If an error occurs, the previous segment list and tombstone state are restored.
+- **Tombstone garbage collection:** Following compaction, tombstones for vectors belonging to the purged sealed segments are permanently discarded from `_tombstones`, retaining only any pending MemTable tombstones.
+- **Immutable sealed segments:** In accordance with LSM-VEC (§3.2), sealed segments are write-once disk blocks. Deletions never rewrite on-disk postings; they are recorded in segment tombstone sets and filtered during query scoring until compaction reclaims physical space.
+- **Fixed-Δ replica membership:** Each sealed segment enforces relative border membership ($r(x) = d_2/d_1 - 1 \le \Delta$). The MemTable maintains strictly flat membership ($members = owned$).
+- **Cross-segment canonical ownership:** Every live vector is owned by exactly one unit (either a specific leaf posting of one sealed segment, or the MemTable), audited by `audit_maintainer`.
+- Record `flushes`, `compaction_events`, `vectors_reclustered`, `hierarchy_rebuilds`, and unit counts over time.
 
 **In-place (`inplace.py`)** — one segment, mutated.
 

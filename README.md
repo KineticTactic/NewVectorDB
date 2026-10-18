@@ -61,6 +61,18 @@ python -m vecstudy.harness.runner churn `
 
 This compares `inplace` and `outofplace` strategies across initial hierarchy depths 1, 2, 3, and 4 under the **exact same initial corpus, index configuration, and deterministic ordered churn workload**.
 
+### 3. Continuous Live-Churn Monitor
+
+Continuously observe real-time recall, structural events (splits/merges in-place; flushes/compactions out-of-place), and invariant audits per operation until stopped with Ctrl+C:
+
+```powershell
+# Monitor in-place maintenance
+python scripts/live_churn.py --strategy inplace --initial-size 300 --depth 2
+
+# Monitor out-of-place maintenance
+python scripts/live_churn.py --strategy outofplace --initial-size 300 --depth 2 --memtable-limit 50 --compaction-threshold 4
+```
+
 #### Churn Configuration Schema (`sweeps/churn_depth_study.yaml`)
 
 ```yaml
@@ -155,6 +167,10 @@ grid:
   Replica work is counted by `replicas_added`, `replicas_removed` and
   `membership_vectors_recomputed`, separate from `vectors_reassigned` and from the query counters;
   its distances land in the `maintenance` bucket.
+- Out-of-place membership is audited by `churn.audit_outofplace_membership`: MemTable entries are flat
+  ($members = owned$), while sealed segments maintain fixed-Δ membership over live members.
+  Tombstones on immutable sealed segments remain in physical postings until compaction purges them
+  and performs tombstone garbage collection.
 
 ## Results and Data
 

@@ -4,7 +4,7 @@
 > **Purpose:** A controlled research instrument for measuring how index-maintenance strategy interacts with hierarchy depth in a clustering-based vector index.  
 > **Language:** Python 3.11 � NumPy � scikit-learn � PyArrow  
 > **Dataset:** SIFT1M (1,000,000 � 128-D float32 vectors)  
-> **Tests:** 47 / 47 passing
+> **Tests:** 232 / 232 passing
 
 ---
 
@@ -19,8 +19,9 @@
 7. [Test Suite](#7-test-suite)
 8. [SIFT1M Results](#8-sift1m-results)
 9. [Result Interpretation](#9-result-interpretation)
-10. [Usage](#10-usage)
-11. [Known Limitations](#11-known-limitations)
+10. [Research Track R1: In-Place vs. Out-of-Place Maintenance under Churn](#10-research-track-r1-in-place-vs-out-of-place-maintenance-under-churn)
+11. [Usage](#11-usage)
+12. [Known Limitations](#12-known-limitations)
 
 ---
 
@@ -378,7 +379,42 @@ With MiniBatchKMeans and no balancing pass: mean=800, p99=4,962, max=12,715. A p
 
 ---
 
-## 10. Usage
+## 10. Research Track R1: In-Place vs. Out-of-Place Maintenance under Churn
+
+Track R1 evaluated the core trade-off between **In-Place (SPFresh)** and **Out-of-Place (LSM-Vec)** index maintenance across hierarchy depths 1 through 4 under continuous dynamic churn (`sweeps/churn_depth_study.yaml`).
+
+### 10.1 Key Empirical Findings
+
+1. **Write Ingestion Throughput (§11.7):**
+   - Out-of-place achieves $O(1)$ write cost on the insert path with **0 distance evaluations** by buffering fresh vectors in a flat MemTable.
+   - In-place requires full tree descent on every insert ($O(B \cdot \text{depth})$ distance evaluations), paying eager routing overhead up-front.
+2. **Reassignment vs. Compaction Costs (§11.9):**
+   - In-place localized reassignment bounds the vectors evaluated per split using a provable bounding radius ($r_b$).
+   - Out-of-place compacts coarse batches, periodically re-clustering all live vectors across sealed segments (4,811 live vectors consolidated at Checkpoint 4).
+3. **Recall Preservation (§11.11):**
+   - In-place reaches **0.6260 recall@10** at Checkpoint 4 (steady across all depths 1–4).
+   - Out-of-place reaches **0.5930 recall@10** (steady across all depths 1–4). Multi-segment index fragmentation causes slight routing loss when `n_postings=1` is allocated across disjoint sealed segments.
+4. **Read Amplification:**
+   - Out-of-place incurs **2.26× to 3.07× higher scan distance** per query batch (60,217 to 81,757 vectors scanned vs. 26,616 for in-place) because queries must scan the flat MemTable and fan out across active sealed segments.
+5. **Depth Interaction:**
+   - Hierarchy depth scales routing costs logarithmically ($O(B \cdot \text{depth})$) in both strategies, while search recall remains robust across depths 1 through 4 when beam=8 is used.
+
+### 10.2 Churn Benchmark Summary (Checkpoint 4 / Final 2,000 Operations)
+
+| Strategy | Configured Depth | Actual Depth | Recall@10 | Routing Dist | Scan Dist | Vectors Scanned | Searchable Units | Compactions | Invariant Violations |
+|---|---|---|---|---|---|---|---|---|---|
+| `inplace` | 1 | 1 | 0.6260 | 2,000 | 26,616 | 26,616 | 1 | 0 | 0 |
+| `inplace` | 2 | 2 | 0.6260 | 2,100 | 26,616 | 26,616 | 1 | 0 | 0 |
+| `inplace` | 3 | 3 | 0.6260 | 2,500 | 26,616 | 26,616 | 1 | 0 | 0 |
+| `inplace` | 4 | 4 | 0.6260 | 3,100 | 26,616 | 26,616 | 1 | 0 | 0 |
+| `outofplace` | 1 | 1 | 0.5930 | 2,700 | 60,217 | 60,217 | 3 | 1 | 0 |
+| `outofplace` | 2 | 2 | 0.5930 | 2,900 | 60,217 | 60,217 | 3 | 1 | 0 |
+| `outofplace` | 3 | 3 | 0.5930 | 3,400 | 60,217 | 60,217 | 3 | 1 | 0 |
+| `outofplace` | 4 | 4 | 0.5930 | 4,000 | 60,217 | 60,217 | 3 | 1 | 0 |
+
+---
+
+## 11. Usage
 
 ### Environment setup
 
@@ -451,7 +487,7 @@ grid:
 
 ---
 
-## 11. Known Limitations
+## 12. Known Limitations
 
 | Limitation | Impact | Fix path |
 |------------|--------|----------|
