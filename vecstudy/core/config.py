@@ -49,7 +49,11 @@ class MaintainConfig:
     memtable_limit: int = 10_000       # out-of-place: flush threshold
     compaction_threshold: int = 4      # out-of-place: compact at m sealed segments
     split_threshold: int = 1_600       # in-place: 2 × leaf_size
-    n_reassign_neighbours: int = 8     # in-place: neighbourhood reassignment width
+    # In-place: legacy neighbourhood width. Split reassignment no longer ranks
+    # postings by centroid proximity (that heuristic could miss a vector sitting
+    # far from its own centroid); candidate selection is now decided by the
+    # per-posting bounding radius. Kept so existing configs/sweeps still load.
+    n_reassign_neighbours: int = 8
     tombstone_rebuild_frac: float = 0.2  # in-place: rebuild posting fraction
 
     def to_dict(self) -> dict:

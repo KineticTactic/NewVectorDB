@@ -82,7 +82,8 @@ maintain:
   memtable_limit: 500       # out-of-place: MemTable flush threshold
   compaction_threshold: 4   # out-of-place: sealed segment compaction threshold
   split_threshold: 400      # in-place: posting split threshold (2 * leaf_size)
-  n_reassign_neighbours: 8  # in-place: neighbourhood reassignment width
+  n_reassign_neighbours: 8  # in-place: legacy hint, kept for config compatibility
+                            # (split reassignment selects candidates by a sound radius bound)
   tombstone_rebuild_frac: 0.2 # in-place: tombstone rebuild fraction
 
 churn:
@@ -143,6 +144,17 @@ grid:
   2. **Ownership:** `owned ⊆ members`; every live vector has a unique canonical owning posting.
   3. **Nearest Partition Assumption (NPA):** For every live vector, the centroid of its owning posting is nearest among all leaf centroids.
 - If any invariant fails, `correctness_status` is marked `FAILED` and recorded in the result row.
+- `correctness_status` covers coverage, unique canonical ownership and NPA only. It does **not**
+  validate Δ-overlap membership semantics (the `members` replica rule); that is a separate check,
+  `churn.audit_membership`, which re-derives the expected `members` set for every live vector from
+  the current leaf centroids, the canonical owner and the configured Δ (independently of the
+  maintainer's helpers) and reports missing/extra/duplicate/dead memberships.
+- In-place membership is correct at rest after every operation: insert adds the required replica
+  immediately, every split re-derives membership for **all** live vectors (Δ fixed; no dynamic
+  calibration, no RNG filtering), and delete removes the vector from every `members` array at once.
+  Replica work is counted by `replicas_added`, `replicas_removed` and
+  `membership_vectors_recomputed`, separate from `vectors_reassigned` and from the query counters;
+  its distances land in the `maintenance` bucket.
 
 ## Results and Data
 

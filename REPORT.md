@@ -1,9 +1,9 @@
-# vecstudy — Hierarchical Clustering Vector Index
+# vecstudy ï¿½ Hierarchical Clustering Vector Index
 ## Architecture, Implementation & Results
 
 > **Purpose:** A controlled research instrument for measuring how index-maintenance strategy interacts with hierarchy depth in a clustering-based vector index.  
-> **Language:** Python 3.11 · NumPy · scikit-learn · PyArrow  
-> **Dataset:** SIFT1M (1,000,000 × 128-D float32 vectors)  
+> **Language:** Python 3.11 ï¿½ NumPy ï¿½ scikit-learn ï¿½ PyArrow  
+> **Dataset:** SIFT1M (1,000,000 ï¿½ 128-D float32 vectors)  
 > **Tests:** 47 / 47 passing
 
 ---
@@ -41,24 +41,24 @@ Three principles govern every design decision:
 ```
 vecstudy/
 +-- core/
-¦   +-- types.py        — VectorId, PostingId, Posting, HierarchyLevel
-¦   +-- config.py       — IndexConfig, QueryConfig, MaintainConfig, ExperimentConfig
-¦   +-- metrics.py      — Counters (search + maintenance lifetimes)
-¦   +-- distance.py     — sim_one_to_many, sim_many_to_many (ALL distances go here)
-¦   +-- clustering.py   — balanced_kmeans
+ï¿½   +-- types.py        ï¿½ VectorId, PostingId, Posting, HierarchyLevel
+ï¿½   +-- config.py       ï¿½ IndexConfig, QueryConfig, MaintainConfig, ExperimentConfig
+ï¿½   +-- metrics.py      ï¿½ Counters (search + maintenance lifetimes)
+ï¿½   +-- distance.py     ï¿½ sim_one_to_many, sim_many_to_many (ALL distances go here)
+ï¿½   +-- clustering.py   ï¿½ balanced_kmeans
 +-- index/
-¦   +-- hierarchy.py    — build_hierarchy, descend, descend_global
-¦   +-- postings.py     — assign (delta-overlap), fetch_posting (simulated I/O)
-¦   +-- segment.py      — Segment (hierarchy + postings + tombstones)
-¦   +-- query.py        — search() THE only search function
+ï¿½   +-- hierarchy.py    ï¿½ build_hierarchy, descend, descend_global
+ï¿½   +-- postings.py     ï¿½ assign (delta-overlap), fetch_posting (simulated I/O)
+ï¿½   +-- segment.py      ï¿½ Segment (hierarchy + postings + tombstones)
+ï¿½   +-- query.py        ï¿½ search() THE only search function
 +-- maintain/
-¦   +-- base.py         — IndexMaintainer ABC
-¦   +-- outofplace.py   — MemTable -> flush -> seal -> compact
-¦   +-- inplace.py      — insert -> split -> neighbourhood reassign -> promote
+ï¿½   +-- base.py         ï¿½ IndexMaintainer ABC
+ï¿½   +-- outofplace.py   ï¿½ MemTable -> flush -> seal -> compact
+ï¿½   +-- inplace.py      ï¿½ insert -> split -> neighbourhood reassign -> promote
 +-- harness/
-¦   +-- datasets.py     — loaders, synthetic generator, brute-force GT
-¦   +-- results.py      — Parquet writer (40 columns per row)
-¦   +-- runner.py       — CLI: single + sweep entry points
+ï¿½   +-- datasets.py     ï¿½ loaders, synthetic generator, brute-force GT
+ï¿½   +-- results.py      ï¿½ Parquet writer (40 columns per row)
+ï¿½   +-- runner.py       ï¿½ CLI: single + sweep entry points
 tests/
 sweeps/
 scripts/
@@ -151,10 +151,12 @@ THE only search function. Over-fetch `k'' = ceil(k * (1 + overfetch))`. Tombston
 ### maintain/inplace.py
 
 The critical step is `_reassign_neighbourhood`:
-1. Find n_reassign_neighbours (default 8) postings nearest the split''s original centroid
-2. Union their owned vids with the split posting''s vids  
-3. Re-score all against ALL affected centroids jointly
+1. Keep a bounding radius per posting (max distance from its centroid to a vector it owns), updated on insert, split, reassignment and tombstone rebuild
+2. Select candidate postings by a sufficient bound, not by centroid proximity: a posting is skipped only when its ball provably cannot be beaten by the split's new centroids (and cannot beat them for the split posting's vectors)
+3. Re-score the affected vids against the affected centroids jointly
 4. Move each vector to its new nearest owner
+
+Ranking postings by centroid distance is unsound: a vector can sit far from its own stale centroid while a new centroid lands near it, so the split invalidates an owner the k-nearest set never contains. Vectors owned by unchanged postings are decided with three similarities (their owner plus the two new centroids) because only those centroids moved.
 
 Local-only reassignment (only within the split posting) is a silent correctness bug -- recall decays with every split and the NPA test is the only thing that catches it.
 
@@ -180,7 +182,7 @@ Every live member of every fetched posting is exact-scored. Local centroids insi
 
 ### 4.4 NPA reassignment is neighbourhood-wide
 
-After splitting posting P, the n_reassign_neighbours nearest postings are collected and all their owned vectors are re-assigned jointly across all affected centroids. Local-only reassignment violates NPA silently.
+After splitting posting P, candidate postings are collected with a per-posting bounding-radius argument rather than centroid proximity, and their owned vectors are re-assigned jointly across all affected centroids. Local-only reassignment violates NPA silently; so does centroid-proximity selection, which misses vectors that are far from their own posting centroid. The `n_reassign_neighbours` config field is retained for compatibility only.
 
 ### 4.5 Chunked similarity computation
 

@@ -27,6 +27,12 @@ class Counters:
 
     # ---- maintenance counters (accumulate for whole run) ------------------
     splits: int = 0
+    # fixed-Δ membership maintenance (distinct from canonical ownership):
+    # replicas_added/removed are event counts, membership_vectors_recomputed
+    # counts vectors whose membership was re-derived by a full pass.
+    replicas_added: int = 0
+    replicas_removed: int = 0
+    membership_vectors_recomputed: int = 0
     vectors_reassigned: int = 0
     compaction_events: int = 0
     vectors_reclustered: int = 0
@@ -69,6 +75,9 @@ class Counters:
         return {
             "splits": self.splits,
             "vectors_reassigned": self.vectors_reassigned,
+            "replicas_added": self.replicas_added,
+            "replicas_removed": self.replicas_removed,
+            "membership_vectors_recomputed": self.membership_vectors_recomputed,
             "compaction_events": self.compaction_events,
             "vectors_reclustered": self.vectors_reclustered,
             "npa_violations_detected": self.npa_violations_detected,
@@ -95,6 +104,9 @@ class Counters:
         # maintenance
         c.splits += other.splits
         c.vectors_reassigned += other.vectors_reassigned
+        c.replicas_added += other.replicas_added
+        c.replicas_removed += other.replicas_removed
+        c.membership_vectors_recomputed += other.membership_vectors_recomputed
         c.compaction_events += other.compaction_events
         c.vectors_reclustered += other.vectors_reclustered
         c.npa_violations_detected += other.npa_violations_detected

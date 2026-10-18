@@ -153,6 +153,11 @@ def _evaluate_checkpoint(
     """Evaluate maintainer at a checkpoint, audit invariants, and construct result row."""
     # 1. Audit structural invariants and NPA
     audit = audit_maintainer(maint, expected_live_vids=current_live_vids)
+    # PASSED means coverage + unique canonical ownership + NPA all hold. It is
+    # not an overlap-correctness claim: this auditor never re-checks the Δ
+    # replica rule. Membership has its own audit (`audit_membership`), which the
+    # test suite runs after every insert/split/delete; it is not folded into
+    # `correctness_status`, whose meaning stays ownership/NPA-only.
     correctness_status = "PASSED" if audit.passed else "FAILED"
 
     # 2. Compute exact ground truth on currently live vectors

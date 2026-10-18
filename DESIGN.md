@@ -189,6 +189,19 @@ When `rng_rule` is on, skip the replica if the two centroids are closer to each 
 
 Return the realised `bloat = total_members / N - 1`. **Always record it**; it's half of every cost comparison involving overlap.
 
+**Membership ≠ ownership.** `owned` is the canonical owner (exactly one posting per live vector, NPA-checked); `members` is the searchable set (owner plus the Δ replicas). Δ is **fixed**: no calibration, no budget inversion, no RNG filtering in the in-place arm. The in-place maintainer keeps the two consistent by construction:
+
+| event | ownership | membership |
+|---|---|---|
+| insert | nearest leaf centroid (ties → lowest posting id) | owner + the best *other* posting iff `d2 <= d1*(1+Δ)` (one extra at most) |
+| split | full reassignment of every posting the new centroids can contest | full re-derivation for **all** live vectors from the new centroids |
+| delete | tombstone, dropped from `owned` | dropped from every `members` array immediately; never re-added (tombstones are excluded from live sets) |
+| overlap disabled (`delta is None`) | as above | `members == owned`, no membership pass runs |
+
+A split re-derives membership because eligibility is a property of the *centroid layout*: a vector whose owner does not change can still gain or lose a replica, and the set of vectors whose owner changes is not the set whose replicas change. The candidate set for the membership pass is "all live vectors" on purpose — any neighbourhood-restricted set needs a bound proving no vector outside it can become eligible, and no such bound exists for a stale-centroid index. Cost is one `N_live × K` similarity block per split, charged to the `maintenance` distance bucket, never to `routing`/`scan`.
+
+Membership is audited separately from NPA by `harness.churn.audit_membership`, which re-derives the expected `members` set per live vector from the centroids, the canonical owner and Δ using the `r(x) = d2/d1 - 1 <= Δ` form (independently of the maintainer's helpers).
+
 **Simulated I/O.** Postings are in memory. Reading one increments:
 
 ```python
@@ -244,7 +257,7 @@ class IndexMaintainer(ABC):
 
 - Insert: descend to the nearest leaf posting, append to `owned` and `members`.
 - When a posting's `owned` count exceeds `split_threshold`, split it in two via `balanced_kmeans(k=2)`.
-- **Then reassign, and this is the part that is easy to get wrong.** After a split produces centroids `c1, c2`, gather the `n_reassign_neighbours` (default 8) postings nearest to the split's original centroid. For every vector in the union of the split posting *and* those neighbours, recompute its nearest centroid among the affected set and move it if its owner changed. Reassigning only within the split posting leaves neighbouring vectors in violation of NPA and recall decays silently with every split.
+- **Then reassign, and this is the part that is easy to get wrong.** After a split produces centroids `c1, c2`, only two centroids have changed: the two halves of the split posting. Every other posting centroid is untouched, and the index satisfied NPA before the split, so a vector owned by another posting `b` can only lose ownership to `c1` or `c2`. Select candidate postings with a bound that is *provably sufficient*, not by centroid proximity: keep a per-posting bounding radius `r_b` (the maximum distance from `b`'s centroid to a vector it owns) up to date on every ownership change, and include `b` only when the ball `(centroid_b, r_b)` can contain a vector that `c1`/`c2` can beat — or, for the split posting's own vectors, when `b` can beat `c1`/`c2` inside the split posting's ball. Recompute the owner of each affected vector over the affected centroids and move it if the owner changed. Ranking postings by centroid distance ("the k nearest to the split") is **unsound**: a vector can sit far from its own stale centroid while a new centroid lands on top of it, so the split invalidates a vector in a posting that the k-nearest set never contains. `n_reassign_neighbours` is retained in `MaintainConfig` for config compatibility only; it no longer gates correctness.
 - Promote both new centroids into the parent level. If the parent exceeds `branching_factor`, split it too and recurse upward. If the root splits, add a level.
 - Record `splits`, `vectors_reassigned`, `npa_violations_detected`, and depth over time.
 
@@ -318,7 +331,7 @@ Tests assert **invariants**, not magic numbers. Every test uses a fixed seed.
 
 1. **Coverage** — every non-deleted vector appears in at least one posting's `members`.
 2. **Ownership** — `owned ⊆ members` for every posting; every vector is `owned` by exactly one.
-3. **NPA** — for every vector, the centroid of its owning posting is its nearest among all posting centroids. Must hold after every maintenance operation. *This is the test that catches the local-only-reassignment bug.*
+3. **NPA** — for every vector, the centroid of its owning posting is its nearest among all posting centroids. Must hold after every maintenance operation. Exact ties resolve to the lowest posting id (the same stable tie-break as `descend`) and are accepted as valid within the auditor's tolerance. *This is the test that catches the local-only-reassignment bug.*
 4. **Beam monotonicity** — recall@10 is non-decreasing in beam width, all else fixed.
 5. **Probe monotonicity** — recall@10 is non-decreasing in `n_postings`.
 6. **Overlap bound** — with the top-2 rule, no vector appears in more than 2 postings.
