@@ -43,6 +43,23 @@ def _owned_spread(vectors: np.ndarray, centroid: np.ndarray,
     return float(np.max(np.linalg.norm(X - centroid.astype(np.float32), axis=1)))
 
 
+# Round-off slack for the split-candidate pruning bound (``_ball_may_switch``).
+#
+# The bound is assembled from float32 quantities: inner products of stored
+# centroids (BLAS accumulation), a float32 ``np.linalg.norm``-based ball radius
+# and a float32 squared centroid distance.  Near zero it therefore carries an
+# error of a few ULP of the terms involved, so an exact ``>= 0.0`` can prune a
+# candidate whose true bound is exactly zero (reachable tie) or a hair positive
+# (reachable win).  Pruning is the unsafe direction — a dropped candidate is
+# never re-examined — while over-inclusion merely costs one extra screen, and
+# the per-vector screen plus ``np.argmax`` still produce the production owner.
+# The comparison is thus tolerated, not exact.  ``1e-5`` matches the NPA
+# auditor's acceptance tolerance; the absolute floor covers bounds that are
+# exactly zero in exact arithmetic but not bitwise.
+_BOUND_REL_TOL = 1e-5
+_BOUND_ABS_TOL = 1e-9
+
+
 def _ball_may_switch(
     ref_dot_target: float,
     ref_dot_competitor: float,
@@ -56,23 +73,29 @@ def _ball_may_switch(
     tie-break as ``np.argmax`` over the leaf centroids: when two postings score
     a vector equally, the **lower posting id** owns it.  A reachable tie is
     therefore a reachable ownership change, so pruning is only allowed when the
-    bound is *strictly* below the competitor.
+    bound is provably below the competitor.
 
     ``ref_dot_target`` / ``ref_dot_competitor`` are inner products of the ball
     centre with the two centroids; ``target_minus_competitor_sq`` is
     ``||target - competitor||²``.  Over the ball the inner-product difference
     ``x·(target - competitor)`` is maximised at
-    ``ref·(target - competitor) + radius·||target - competitor||``; a strictly
-    negative maximum is a proof that no owned vector can tie or switch.
+    ``ref·(target - competitor) + radius·||target - competitor||``.
+
+    The maximum is compared against ``-slack`` rather than ``0`` (see
+    ``_BOUND_REL_TOL``): the inputs are float32, so a computed value a few ULP
+    below zero is not a proof that the true maximum is negative.  Only a bound
+    that is clearly below zero prunes.
     """
     if target_minus_competitor_sq <= 0.0:
         # Coincident centroids: every vector in the ball ties, and the lower
         # posting id wins the tie, so ownership may change.
         return True
-    return (
-        ref_dot_target - ref_dot_competitor
-        + radius * math.sqrt(target_minus_competitor_sq)
-    ) >= 0.0
+    sphere_term = radius * math.sqrt(target_minus_competitor_sq)
+    bound = ref_dot_target - ref_dot_competitor + sphere_term
+    slack = _BOUND_REL_TOL * (
+        abs(ref_dot_target) + abs(ref_dot_competitor) + abs(sphere_term)
+    )
+    return bound >= -max(slack, _BOUND_ABS_TOL)
 
 
 # ---------------------------------------------------------------------------
@@ -366,9 +389,11 @@ class InPlaceMaintainer(IndexMaintainer):
 
         Ties follow the same rule as the auditor (``np.argmax`` over the leaf
         centroids): an exact tie is resolved to the lowest posting id.  That is
-        why the bound admits the closed boundary (``_ball_may_switch``) and why
-        the per-vector screen below uses ``>=``: a vector that only ties with a
-        new centroid still changes owner when that centroid has a lower id.
+        why the bound admits the closed boundary (``_ball_may_switch``), why it
+        additionally keeps candidates whose float32 bound lands a little below
+        zero (round-off slack), and why the per-vector screen below uses ``>=``:
+        a vector that only ties with a new centroid still changes owner when
+        that centroid has a lower id.
         """
         leaf_centroids = self._segment.levels[-1].centroids
         K = len(leaf_centroids)

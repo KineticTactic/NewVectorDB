@@ -53,6 +53,7 @@ from vecstudy.core.metrics import Counters
 from vecstudy.core.types import HierarchyLevel, Posting
 from vecstudy.harness.churn import audit_maintainer
 from vecstudy.harness.datasets import make_synthetic
+from vecstudy.index.hierarchy import _stable_top_k
 from vecstudy.index.segment import Segment
 from vecstudy.maintain.inplace import InPlaceMaintainer, _ball_may_switch
 
@@ -571,3 +572,227 @@ def test_random_workload_with_splits_stays_npa_clean():
     assert audit.passed is True, f"{audit.summary()}; examples={audit.examples}"
     assert audit.live_vectors_checked == n_insert
     assert audit.postings_checked == len(maint._segment.postings)
+
+
+# ---------------------------------------------------------------------------
+# R1 Task 3 — pruning / tie-boundary regression
+#
+# Ownership is ``np.argmax`` over the leaf centroids, so an exact score tie
+# resolves to the lowest posting id.  The split candidate filter prunes a
+# posting only through ``_ball_may_switch``; these tests pin the four boundary
+# cases of that predicate end-to-end (the owner the production path must
+# produce), plus the float round-off slack that separates a real proof from a
+# rounded bound.
+# ---------------------------------------------------------------------------
+
+
+def _two_posting_maintainer(
+    first_vec: np.ndarray,
+    second_vec: np.ndarray,
+    probe: np.ndarray,
+    a_old: np.ndarray,
+    b_centroid: np.ndarray,
+    *,
+    delta: float | None = None,
+    split_threshold: int = 1,
+) -> tuple[InPlaceMaintainer, np.ndarray]:
+    """A owning {vid0}, B owning {vid2}; inserting vid1 splits A into singletons.
+
+    ``balanced_kmeans`` with two points and two clusters is the identity, so
+    ``first_vec`` becomes posting 0's centroid (the reused, lower id) and
+    ``second_vec`` becomes the appended posting's centroid [2].  B keeps id 1.
+    """
+    X = np.stack([first_vec, second_vec, probe]).astype(np.float32)
+    postings = [
+        Posting(0, np.asarray(a_old, dtype=np.float32),
+                np.array([0], dtype=np.int64), np.array([0], dtype=np.int64)),
+        Posting(1, np.asarray(b_centroid, dtype=np.float32),
+                np.array([2], dtype=np.int64), np.array([2], dtype=np.int64)),
+    ]
+    leaf = HierarchyLevel(
+        centroids=np.stack([p.centroid for p in postings]).astype(np.float32),
+        children=[],
+    )
+    seg = Segment(levels=[leaf], postings=postings, vectors=X)
+    cfg_index = IndexConfig(
+        dim=X.shape[1], leaf_size=100, branching_factor=4, seed=0, depth=1,
+        delta=delta,
+    )
+    cfg_maint = MaintainConfig(strategy="inplace", split_threshold=split_threshold)
+    maint = InPlaceMaintainer(X, cfg_index, cfg_maint, Counters(), initial_segment=seg)
+    return maint, X
+
+
+def _strict_owner(seg: Segment, vid: int) -> int:
+    sims = seg.levels[-1].centroids @ seg.vectors[vid].astype(np.float32)
+    return int(np.argmax(sims))
+
+
+def test_bound_prunes_strictly_worse_candidate():
+    """A posting whose ball bound is strictly below the competitor is skipped.
+
+    Predicate form: the exact float arguments put the maximum clearly below
+    zero.  End-to-end form: B's ball degenerates to the probe itself and the
+    split's new centroids are far worse, so B is a non-source and the probe
+    must keep B as its owner.
+    """
+    assert _ball_may_switch(0.0, 0.5, 0.49, 1.0) is False
+    assert _ball_may_switch(0.25, 0.5, 0.2, 1.0) is False
+
+    probe = _unit(0.0)
+    maint, X = _two_posting_maintainer(
+        _unit(120.0), _unit(130.0), probe, _unit(125.0), probe
+    )
+    maint.insert(1, X[1])
+    seg = maint._segment
+    assert len(seg.postings) == 3
+    # probe . first = cos 120 = -0.5, probe . B = 1 -> bound = -1.5, pruned.
+    assert _owner_pids(seg, 2) == [1]
+    assert _strict_owner(seg, 2) == 1
+    audit = audit_maintainer(maint, expected_live_vids={0, 1, 2})
+    assert audit.passed is True, audit.examples
+
+
+def test_tie_with_lower_id_target_moves_owner():
+    """A reachable exact tie is resolved to the lower posting id.
+
+    B (id 1) owns the probe.  The split reuses id 0 with a centroid that
+    ``probe`` scores exactly equally against, so the probe must move to 0.  This
+    is the case a ``> 0`` (strict) prune would have missed.
+    """
+    probe = _unit(0.0)
+    maint, X = _two_posting_maintainer(
+        _unit(60.0), _unit(65.0), probe, _unit(70.0), _unit(-60.0)
+    )
+    maint.insert(1, X[1])
+    seg = maint._segment
+    assert len(seg.postings) == 3
+
+    sims = seg.levels[-1].centroids @ probe
+    assert sims[0] == sims[1], "fixture must produce an exact tie between 0 and 1"
+    assert sims[0] == np.float32(0.5)
+
+    assert _owner_pids(seg, 2) == [0]
+    assert _strict_owner(seg, 2) == 0
+    audit = audit_maintainer(maint, expected_live_vids={0, 1, 2})
+    assert audit.passed is True, audit.examples
+
+
+def test_tie_with_lower_id_owner_keeps_owner():
+    """An exact tie against a higher-id target leaves the lower-id owner in place.
+
+    B (id 1) owns the probe; the split's appended centroid (id 2) scores exactly
+    equally against it, while the reused centroid (id 0) is strictly worse.  The
+    tie is B's, so the probe must stay with B.
+    """
+    probe = _unit(0.0)
+    maint, X = _two_posting_maintainer(
+        _unit(150.0), _unit(60.0), probe, _unit(70.0), _unit(-60.0)
+    )
+    maint.insert(1, X[1])
+    seg = maint._segment
+    assert len(seg.postings) == 3
+
+    sims = seg.levels[-1].centroids @ probe
+    assert sims[1] == sims[2], "fixture must tie pid 1 (owner) with pid 2"
+    assert sims[0] < sims[1]
+
+    assert _owner_pids(seg, 2) == [1]
+    assert _strict_owner(seg, 2) == 1
+    audit = audit_maintainer(maint, expected_live_vids={0, 1, 2})
+    assert audit.passed is True, audit.examples
+
+
+def test_bound_roundoff_near_tie_is_not_pruned():
+    """A bound a few ULP below zero is not a proof, so it must not prune.
+
+    The bound is assembled from float32 similarities, a float32 radius and a
+    float32 squared distance; near zero it is only trustworthy up to a small
+    slack.  A reachable tie whose computed bound lands at ``-1e-9`` is admitted
+    (over-inclusion is the safe direction); only a clearly negative bound
+    prunes.
+    """
+    # exact boundary (zero) is admitted -- present regression, kept
+    assert _ball_may_switch(0.0, 0.5, 0.5, 1.0) is True
+    # round-off below zero: still admitted
+    assert _ball_may_switch(0.0, 0.5, 0.5 - 1e-9, 1.0) is True
+    assert _ball_may_switch(0.0, 0.5, 0.5 - 1e-12, 1.0) is True
+    # strictly above zero: admitted
+    assert _ball_may_switch(0.0, 0.5, 0.5 + 1e-9, 1.0) is True
+    # clearly negative: pruned
+    assert _ball_may_switch(0.0, 0.5, 0.5 - 1e-2, 1.0) is False
+    # coincident centroids: admitted (reachable tie, lower id wins)
+    assert _ball_may_switch(1.0, 1.0, 0.0, 0.0) is True
+
+
+def test_near_tie_resolves_to_strict_argmax_owner():
+    """A one-ULP score margin still resolves to the strict ``argmax`` owner.
+
+    The split's reused centroid scores ``probe`` one float32 ULP above B's, so
+    the production metric ranks it strictly first.  The maintenance path must
+    produce that same owner, not fall back to the incumbent on a "near tie".
+    """
+    one_ulp_up = np.nextafter(np.float32(0.5), np.float32(1.0))
+    assert one_ulp_up > np.float32(0.5)
+    y = np.float32(np.sqrt(max(0.0, 1.0 - float(one_ulp_up) ** 2)))
+    target = np.array([one_ulp_up, y], dtype=np.float32)
+
+    probe = _unit(0.0)
+    maint, X = _two_posting_maintainer(
+        target, _unit(65.0), probe, _unit(70.0), _unit(-60.0)
+    )
+    maint.insert(1, X[1])
+    seg = maint._segment
+
+    sims = seg.levels[-1].centroids @ probe
+    assert sims[0] > sims[1], "fixture must give pid 0 a strict one-ULP edge"
+    assert sims[0] - sims[1] < np.float32(1e-6)
+
+    assert _owner_pids(seg, 2) == [0]
+    assert _owner_pids(seg, 2) == [_strict_owner(seg, 2)]
+    audit = audit_maintainer(maint, expected_live_vids={0, 1, 2})
+    assert audit.passed is True, audit.examples
+
+
+def test_split_moves_owner_outside_old_neighbourhood():
+    """The repaired split moves a vector the centroid-neighbour list never saw.
+
+    Rebuilds the Task-1 geometry (a probe owned by B, far from the split's
+    centroid neighbourhood) and additionally reconstructs the *old* heuristic's
+    candidate set to prove it excludes B, i.e. the move is only possible because
+    the bounding-radius filter is sound.
+    """
+    maint, X, _ = _make_maintainer(split_threshold=3, n_reassign_neighbours=8)
+    seg = maint._segment
+    _prepare_probe(maint, X)
+    orig_centroid = seg.postings[PID_A].centroid.copy()
+
+    maint.insert(VID_TRIGGER, X[VID_TRIGGER])
+    assert len(seg.postings) == NEW_PID_AFTER_SPLIT + 1
+    split_pids = [p.id for p in seg.postings
+                  if int(p.id) in (PID_A, NEW_PID_AFTER_SPLIT)]
+    assert set(split_pids) == {PID_A, NEW_PID_AFTER_SPLIT}
+
+    leaf = seg.levels[-1].centroids
+    K = len(leaf)
+    n_search = min(8 + 2, K)
+    sims_orig = leaf @ orig_centroid
+    sims_c0 = leaf @ leaf[PID_A]
+    sims_c1 = leaf @ leaf[NEW_PID_AFTER_SPLIT]
+    old_candidates: set[int] = set()
+    for s in (sims_orig, sims_c0, sims_c1):
+        old_candidates.update(int(p) for p in _stable_top_k(-s, n_search))
+
+    # The old heuristic re-scores only the postings it selected.  B -- the
+    # probe's owner -- is not among them, so the probe was never re-examined.
+    assert PID_B not in old_candidates, (
+        "fixture no longer exercises the stale-centroid case"
+    )
+    # The repaired filter did examine B (its bounding ball reaches a new
+    # centroid) and moved the probe to its true nearest posting.
+    new_owner = _strict_owner(seg, VID_PROBE)
+    assert new_owner in (PID_A, NEW_PID_AFTER_SPLIT)
+    assert _owner_pids(seg, VID_PROBE) == [new_owner]
+    assert _owner_pids(seg, VID_PROBE) != [PID_B]
+    audit = audit_maintainer(maint, expected_live_vids=_live_vids(include_trigger=True))
+    assert audit.passed is True, audit.examples
