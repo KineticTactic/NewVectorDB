@@ -1,21 +1,22 @@
 #!/usr/bin/env python
 """scripts/live_churn.py — entry point for the continuous live-churn monitor.
 
-Continuously inserts and deletes vectors on the real in-place maintainer and
-prints recall@k after every operation, until Ctrl+C.  All logic lives in
-``vecstudy.harness.live`` (so it is unit-testable); this file only pins the BLAS
-thread count for determinism, makes the repo importable when run from a checkout,
-and forwards to ``main``.
+Continuously inserts and deletes vectors on the real maintainer (in-place or
+out-of-place) and prints recall@k after every operation, until Ctrl+C.  All logic
+lives in ``vecstudy.harness.live`` (so it is unit-testable); this file only pins
+the BLAS thread count for determinism, makes the repo importable when run from a
+checkout, and forwards to ``main``.
 
 Run from the repository root:
 
-    .venv/bin/python scripts/live_churn.py
+    python scripts/live_churn.py --strategy inplace
+    python scripts/live_churn.py --strategy outofplace --memtable-limit 50
 
 Configurable example:
 
-    .venv/bin/python scripts/live_churn.py \
-        --initial-size 300 --k 10 --query-count 32 --depth 2 \
-        --split-threshold 40 --delta 0.3 --interval 0.2 --seed 7
+    python scripts/live_churn.py \
+        --strategy outofplace --initial-size 300 --k 10 --query-count 32 --depth 2 \
+        --memtable-limit 50 --compaction-threshold 4 --interval 0.2 --seed 7
 """
 
 import os

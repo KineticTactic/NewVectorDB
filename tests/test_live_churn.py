@@ -29,6 +29,7 @@ from vecstudy.harness.churn import (
     AuditResult,
     audit_maintainer,
     audit_membership,
+    audit_outofplace_membership,
 )
 from vecstudy.harness.live import (
     GrowingVectorStore,
@@ -36,6 +37,7 @@ from vecstudy.harness.live import (
     LiveChurnMonitor,
     OperationRecord,
     ObservedInPlaceMaintainer,
+    ObservedOutOfPlaceMaintainer,
 )
 from vecstudy.index.query import search
 
@@ -409,3 +411,109 @@ def test_main_runs_finite_and_exits_zero(capsys):
     assert "initial recall@3=" in out
     assert "Final summary" in out
     assert out.count("vid=") == 3
+
+
+# ---------------------------------------------------------------------------
+# Out-of-place maintenance tests
+# ---------------------------------------------------------------------------
+
+def test_outofplace_cli_parse_and_resolve():
+    args = livemod.build_parser().parse_args([
+        "--strategy", "outofplace", "--memtable-limit", "25",
+        "--compaction-threshold", "3", "--initial-size", "100",
+    ])
+    cfg = livemod.resolve_config(args)
+    assert cfg.strategy == "outofplace"
+    assert cfg.memtable_limit == 25
+    assert cfg.compaction_threshold == 3
+    assert cfg.initial_size == 100
+
+
+def test_outofplace_observed_maintainer_lifecycle():
+    cfg = _cfg(
+        strategy="outofplace", initial_size=20, leaf_size=4,
+        memtable_limit=4, compaction_threshold=2,
+    )
+    m = LiveChurnMonitor(cfg, out=io.StringIO())
+    assert isinstance(m._maint, ObservedOutOfPlaceMaintainer)
+    m.run(max_operations=20)
+    out = m._out.getvalue()
+    stats = m._maint.stats()
+    assert m._op_count == 20
+    assert stats["flushes"] > 0
+    assert "Live churn monitor — outofplace maintenance" in out
+    assert "FLUSH sealed_segments=" in out
+    assert "COMPACT sealed_segments=" in out
+    assert "NPA=PASS" in out and "MEMBERSHIP=PASS" in out
+    assert not m._failed
+
+
+def test_outofplace_store_growth_rebinds_sealed_and_memtable():
+    cfg = _cfg(strategy="outofplace", initial_size=6, leaf_size=2, memtable_limit=3)
+    m = LiveChurnMonitor(cfg, out=io.StringIO())
+    for _ in range(20):
+        m.run_one_operation()
+    assert m._store.n_grows >= 1
+    assert m._maint._vectors is m._store.data
+    for seg in m._maint._sealed:
+        assert seg.vectors is m._store.data
+    for unit in m._maint.searchable_units():
+        assert unit.vectors is m._store.data
+
+
+def test_outofplace_exhaustive_search_recall_is_one():
+    # Fetch every posting → production search is exact → recall must be 1.0.
+    m = _monitor(
+        strategy="outofplace", seed=3, memtable_limit=3, compaction_threshold=2,
+        n_postings=1000, beam=1000, depth=1,
+    )
+    for _ in range(15):
+        m.run_one_operation()
+    assert m.evaluate_recall() == pytest.approx(1.0)
+
+
+def test_outofplace_deleted_ids_are_not_returned():
+    cfg = _cfg(
+        strategy="outofplace", initial_size=24, leaf_size=4,
+        memtable_limit=3, compaction_threshold=2,
+        n_postings=1000, beam=1000, depth=1,
+    )
+    m = LiveChurnMonitor(cfg, out=io.StringIO())
+    deleted: set[int] = set()
+    for _ in range(12):
+        r = m.run_one_operation()
+        if r.op == "DELETE":
+            deleted.add(r.vid)
+    assert deleted
+    assert m._live_set.isdisjoint(deleted)
+    for q in m._queries:
+        for vid, _ in search(q, m._maint.searchable_units(), m._cfg_query, Counters()):
+            assert vid not in deleted
+
+
+def test_outofplace_audit_failure_is_visible_and_stops(monkeypatch):
+    cfg = _cfg(strategy="outofplace")
+    m = LiveChurnMonitor(cfg, out=io.StringIO())
+    monkeypatch.setattr(livemod, "audit_maintainer", _failing_audit)
+    m.run(max_operations=10)
+    out = m._out.getvalue()
+    assert "NPA=FAIL" in out
+    assert "!!" in out
+    assert "stopped: audit failure" in out
+    assert m._op_count == 1
+    assert m._failed
+
+
+def test_outofplace_main_runs_finite_and_exits_zero(capsys):
+    rc = livemod.main([
+        "--strategy", "outofplace", "--initial-size", "20", "--dim", "8",
+        "--leaf-size", "4", "--memtable-limit", "3", "--compaction-threshold", "2",
+        "--k", "3", "--query-count", "4", "--interval", "0",
+        "--max-operations", "6", "--summary-every", "0", "--depth", "1",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Live churn monitor — outofplace maintenance" in out
+    assert "initial recall@3=" in out
+    assert "Final summary" in out
+    assert out.count("vid=") == 6

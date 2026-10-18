@@ -504,6 +504,7 @@ def _audit_segment_membership(
     tombstones: set[int],
     delta: float | None,
     segment_prefix: str = "",
+    allow_tombstoned_members: bool = False,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict], list[dict], int, int]:
     centroids = seg.levels[-1].centroids
     owners: dict[int, list[int]] = {}
@@ -515,13 +516,16 @@ def _audit_segment_membership(
         counts: dict[int, int] = {}
         for vid in p.members.tolist():
             v = int(vid)
+            if v in tombstones:
+                if not allow_tombstoned_members:
+                    rec = {"vid": v, "pid": int(p.id)}
+                    if segment_prefix:
+                        rec["segment"] = segment_prefix
+                    dead_members.append(rec)
+                continue
             counts[v] = counts.get(v, 0) + 1
             members_of.setdefault(v, []).append(int(p.id))
-            if v in tombstones:
-                rec = {"vid": v, "pid": int(p.id)}
-                if segment_prefix:
-                    rec["segment"] = segment_prefix
-                dead_members.append(rec)
+
         for v, c in sorted(counts.items()):
             if c > 1:
                 rec = {"vid": v, "pid": int(p.id), "count": c}
@@ -631,7 +635,7 @@ def audit_membership(
     if isinstance(maint, InPlaceMaintainer):
         seg = maint._segment
         tombstones = set(seg.tombstones) | set(getattr(maint, "_tombstones", set()))
-        res = _audit_segment_membership(seg, tombstones, delta)
+        res = _audit_segment_membership(seg, tombstones, delta, allow_tombstoned_members=False)
         return MembershipAuditResult(
             missing=res[0],
             extra=res[1],
@@ -656,7 +660,9 @@ def audit_membership(
     global_tombstones = set(maint._tombstones)
     for s_idx, seg in enumerate(maint._sealed):
         tombstones = set(seg.tombstones) | global_tombstones
-        res = _audit_segment_membership(seg, tombstones, delta, segment_prefix=f"sealed[{s_idx}]")
+        res = _audit_segment_membership(
+            seg, tombstones, delta, segment_prefix=f"sealed[{s_idx}]", allow_tombstoned_members=True
+        )
         all_missing.extend(res[0])
         all_extra.extend(res[1])
         all_duplicates.extend(res[2])
@@ -671,9 +677,7 @@ def audit_membership(
         mem_counts: dict[int, int] = {}
         for vid in maint._memtable:
             vi = int(vid)
-            if vi in global_tombstones:
-                all_dead_members.append({"vid": vi, "unit": "memtable"})
-            else:
+            if vi not in global_tombstones:
                 mem_counts[vi] = mem_counts.get(vi, 0) + 1
         for vi, c in sorted(mem_counts.items()):
             if c > 1:

@@ -51,9 +51,11 @@ from ..core.config import IndexConfig, MaintainConfig, QueryConfig
 from ..core.metrics import Counters
 from ..core.types import VectorId
 from ..index.query import search
-from .churn import audit_maintainer, audit_membership
+from .churn import audit_maintainer, audit_membership, audit_outofplace_membership
 from .datasets import make_synthetic, recall_at_k
+from ..maintain.base import IndexMaintainer
 from ..maintain.inplace import InPlaceMaintainer
+from ..maintain.outofplace import OutOfPlaceMaintainer
 
 # ---------------------------------------------------------------------------
 # Reproducible, growing backing store
@@ -125,12 +127,15 @@ class GrowingVectorStore:
         self._size += 1
         return self._size - 1
 
-    def bind(self, maint: InPlaceMaintainer) -> None:
+    def bind(self, maint: IndexMaintainer) -> None:
         """Re-point *maint* and every searchable unit at the current array.
 
         Called after a growth so no object keeps a stale (too-small) reference.
         """
         maint._vectors = self._data
+        if hasattr(maint, "_sealed"):
+            for seg in maint._sealed:
+                seg.vectors = self._data
         for unit in maint.searchable_units():
             unit.vectors = self._data
 
@@ -141,23 +146,34 @@ class GrowingVectorStore:
 
 @dataclass
 class StructuralEvent:
-    """One real split or merge, captured as it is performed."""
-    kind: str                       # "SPLIT" | "MERGE"
+    """One real split, merge, flush, or compaction, captured as it is performed."""
+    kind: str                       # "SPLIT" | "MERGE" | "FLUSH" | "COMPACT"
     pid: int | None = None          # split: the posting that was split
     new_pid: int | None = None      # split: the posting appended
     survivor: int | None = None     # merge: surviving posting
     removed: int | None = None      # merge: removed posting
     vectors_reassigned: int = 0
     hierarchy_rebuilds: int = 0
+    segment_count: int = 0          # out-of-place: sealed segment count after event
+    vectors_affected: int = 0       # out-of-place: vectors flushed or reclustered
 
     def format(self) -> str:
         if self.kind == "SPLIT":
             return (f"  SPLIT pid={self.pid} new_pid={self.new_pid} "
                     f"vectors_reassigned={self.vectors_reassigned} "
                     f"hierarchy_rebuilds={self.hierarchy_rebuilds}")
-        return (f"  MERGE survivor={self.survivor} removed={self.removed} "
-                f"vectors_reassigned={self.vectors_reassigned} "
-                f"hierarchy_rebuilds={self.hierarchy_rebuilds}")
+        if self.kind == "MERGE":
+            return (f"  MERGE survivor={self.survivor} removed={self.removed} "
+                    f"vectors_reassigned={self.vectors_reassigned} "
+                    f"hierarchy_rebuilds={self.hierarchy_rebuilds}")
+        if self.kind == "FLUSH":
+            return (f"  FLUSH sealed_segments={self.segment_count} "
+                    f"vectors={self.vectors_affected}")
+        if self.kind == "COMPACT":
+            return (f"  COMPACT sealed_segments={self.segment_count} "
+                    f"vectors_reclustered={self.vectors_affected} "
+                    f"hierarchy_rebuilds={self.hierarchy_rebuilds}")
+        return f"  {self.kind}"
 
 
 class ObservedInPlaceMaintainer(InPlaceMaintainer):
@@ -208,6 +224,47 @@ class ObservedInPlaceMaintainer(InPlaceMaintainer):
             ))
 
 
+class ObservedOutOfPlaceMaintainer(OutOfPlaceMaintainer):
+    """Real out-of-place maintainer that records its structural events as they happen.
+
+    Only ``_flush`` and ``_compact`` are overridden, purely to observe: each
+    calls the production implementation unchanged and appends an event only when
+    the corresponding counter actually advanced.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.events: list[StructuralEvent] = []
+
+    def drain_events(self) -> list[StructuralEvent]:
+        events, self.events = self.events, []
+        return events
+
+    def _flush(self) -> None:
+        flushes = self._counters.flushes
+        mem_len = len(self._memtable)
+        super()._flush()
+        if self._counters.flushes > flushes:
+            self.events.append(StructuralEvent(
+                "FLUSH",
+                segment_count=len(self._sealed),
+                vectors_affected=mem_len,
+            ))
+
+    def _compact(self) -> None:
+        compactions = self._counters.compaction_events
+        reclustered = self._counters.vectors_reclustered
+        rebuilds = self._counters.hierarchy_rebuilds
+        super()._compact()
+        if self._counters.compaction_events > compactions:
+            self.events.append(StructuralEvent(
+                "COMPACT",
+                segment_count=len(self._sealed),
+                vectors_affected=self._counters.vectors_reclustered - reclustered,
+                hierarchy_rebuilds=self._counters.hierarchy_rebuilds - rebuilds,
+            ))
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -215,6 +272,7 @@ class ObservedInPlaceMaintainer(InPlaceMaintainer):
 @dataclass(frozen=True)
 class LiveChurnConfig:
     """Resolved, validated monitor configuration."""
+    strategy: str = "inplace"
     initial_size: int = 300
     k: int = 10
     query_count: int = 32
@@ -233,8 +291,15 @@ class LiveChurnConfig:
     n_postings: int = 1
     beam: int = 8
     continue_on_audit_failure: bool = False
+    memtable_limit: int = 50
+    compaction_threshold: int = 4
+    tombstone_rebuild_frac: float = 0.20
 
     def __post_init__(self) -> None:
+        if self.strategy not in ("inplace", "outofplace"):
+            raise ValueError(
+                f"unsupported strategy {self.strategy!r}; must be 'inplace' or 'outofplace'"
+            )
         if self.dataset != "synthetic":
             raise ValueError(
                 f"unsupported dataset {self.dataset!r}; this monitor supports "
@@ -270,9 +335,16 @@ class LiveChurnConfig:
             raise ValueError("n_postings must be >= 1")
         if self.beam < 1:
             raise ValueError("beam must be >= 1")
+        if self.memtable_limit < 1:
+            raise ValueError("memtable_limit must be >= 1")
+        if self.compaction_threshold < 2:
+            raise ValueError("compaction_threshold must be >= 2")
+        if not (0.0 <= self.tombstone_rebuild_frac <= 1.0):
+            raise ValueError("tombstone_rebuild_frac must be in [0.0, 1.0]")
 
     def to_dict(self) -> dict:
         return {
+            "strategy": self.strategy,
             "dataset": self.dataset, "dim": self.dim, "seed": self.seed,
             "initial_size": self.initial_size, "k": self.k,
             "query_count": self.query_count, "depth": self.depth,
@@ -283,6 +355,9 @@ class LiveChurnConfig:
             "summary_every": self.summary_every, "n_postings": self.n_postings,
             "beam": self.beam,
             "continue_on_audit_failure": self.continue_on_audit_failure,
+            "memtable_limit": self.memtable_limit,
+            "compaction_threshold": self.compaction_threshold,
+            "tombstone_rebuild_frac": self.tombstone_rebuild_frac,
         }
 
 
@@ -309,6 +384,10 @@ class OperationRecord:
     membership: str = "SKIP"
     detail: str = ""
     failed: bool = False
+    flushes_total: int = 0
+    compactions_total: int = 0
+    sealed_segments: int = 0
+    memtable_size: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +436,12 @@ class LiveChurnMonitor:
             delta=cfg.delta, rng_rule=False, seed=cfg.seed,
         )
         self._cfg_maintain = MaintainConfig(
-            strategy="inplace", split_threshold=cfg.split_threshold,
+            strategy=cfg.strategy,
+            split_threshold=cfg.split_threshold,
             merge_threshold=cfg.merge_threshold,
+            memtable_limit=cfg.memtable_limit,
+            compaction_threshold=cfg.compaction_threshold,
+            tombstone_rebuild_frac=cfg.tombstone_rebuild_frac,
         )
         self._cfg_query = QueryConfig(
             k=cfg.k, beam_widths=(cfg.beam,), n_postings=cfg.n_postings,
@@ -373,10 +456,16 @@ class LiveChurnMonitor:
         self._counters = Counters()
         self._query_counters = Counters()
         initial_vids = np.arange(cfg.initial_size, dtype=np.int64)
-        self._maint = ObservedInPlaceMaintainer(
-            self._store.data, self._cfg_index, self._cfg_maintain,
-            self._counters, initial_vids=initial_vids,
-        )
+        if cfg.strategy == "outofplace":
+            self._maint = ObservedOutOfPlaceMaintainer(
+                self._store.data, self._cfg_index, self._cfg_maintain,
+                self._counters, initial_vids=initial_vids,
+            )
+        else:
+            self._maint = ObservedInPlaceMaintainer(
+                self._store.data, self._cfg_index, self._cfg_maintain,
+                self._counters, initial_vids=initial_vids,
+            )
         self._store.bind(self._maint)
 
         # Live bookkeeping.  ``_live`` is kept sorted ascending: fresh ids are
@@ -489,6 +578,9 @@ class LiveChurnMonitor:
         return {
             "splits": c.splits - before.splits,
             "merges": c.merges - before.merges,
+            "flushes": c.flushes - before.flushes,
+            "compactions": c.compaction_events - before.compaction_events,
+            "vectors_reclustered": c.vectors_reclustered - before.vectors_reclustered,
             "hierarchy_rebuilds": c.hierarchy_rebuilds - before.hierarchy_rebuilds,
             "replicas_added": c.replicas_added - before.replicas_added,
             "replicas_removed": c.replicas_removed - before.replicas_removed,
@@ -509,7 +601,10 @@ class LiveChurnMonitor:
         if self.cfg.audit_every == 0 or self._op_count % self.cfg.audit_every != 0:
             return "SKIP", "SKIP", ""
         npa = audit_maintainer(self._maint, expected_live_vids=self._live_set)
-        mem = audit_membership(self._maint)
+        if isinstance(self._maint, InPlaceMaintainer):
+            mem = audit_membership(self._maint)
+        else:
+            mem = audit_outofplace_membership(self._maint)
         npa_status = "PASS" if npa.passed else "FAIL"
         mem_status = "PASS" if mem.passed else "FAIL"
         detail = ""
@@ -551,6 +646,8 @@ class LiveChurnMonitor:
             self._maint.delete(vid)
             self._deletes += 1
 
+        self._maint.maintain()
+
         elapsed_op = time.perf_counter() - t_op
         self._op_time_sum += elapsed_op
         self._op_count += 1
@@ -579,9 +676,14 @@ class LiveChurnMonitor:
             self._recall_best = max(self._recall_best, recall)
             self._recall_worst = min(self._recall_worst, recall)
 
+        stats = self._maint.stats()
+        leaves = stats.get("n_postings", 0)
+        sealed = stats.get("sealed_segments", 0)
+        mem_size = stats.get("memtable_size", 0)
+
         return OperationRecord(
             index=self._op_count, op=op, vid=vid, live=len(self._live),
-            leaves=len(self._maint._segment.postings),
+            leaves=leaves,
             splits_total=self._counters.splits,
             merges_total=self._counters.merges,
             recall=recall,
@@ -589,18 +691,30 @@ class LiveChurnMonitor:
             elapsed_op=elapsed_op, source_row=source_row, events=events,
             deltas=deltas, npa=npa, membership=mem, detail=detail,
             failed=failed,
+            flushes_total=self._counters.flushes,
+            compactions_total=self._counters.compaction_events,
+            sealed_segments=sealed,
+            memtable_size=mem_size,
         )
 
     # -- formatting -------------------------------------------------------
 
     def format_record(self, r: OperationRecord) -> list[str]:
         recall = "N/A" if r.recall is None else f"{r.recall:.4f}"
-        lines = [
-            f"[{_fmt_elapsed(r.elapsed_total)}] #{r.index:04d} {r.op:<6} "
-            f"vid={r.vid} live={r.live} leaves={r.leaves} "
-            f"splits={r.splits_total} merges={r.merges_total} "
-            f"recall@{self.cfg.k}={recall} NPA={r.npa} MEMBERSHIP={r.membership}"
-        ]
+        if self.cfg.strategy == "outofplace":
+            lines = [
+                f"[{_fmt_elapsed(r.elapsed_total)}] #{r.index:04d} {r.op:<6} "
+                f"vid={r.vid} live={r.live} leaves={r.leaves} sealed={r.sealed_segments} "
+                f"flushes={r.flushes_total} compactions={r.compactions_total} "
+                f"recall@{self.cfg.k}={recall} NPA={r.npa} MEMBERSHIP={r.membership}"
+            ]
+        else:
+            lines = [
+                f"[{_fmt_elapsed(r.elapsed_total)}] #{r.index:04d} {r.op:<6} "
+                f"vid={r.vid} live={r.live} leaves={r.leaves} "
+                f"splits={r.splits_total} merges={r.merges_total} "
+                f"recall@{self.cfg.k}={recall} NPA={r.npa} MEMBERSHIP={r.membership}"
+            ]
         for ev in r.events:
             lines.append(ev.format())
         active = {k: v for k, v in r.deltas.items() if v}
@@ -619,22 +733,31 @@ class LiveChurnMonitor:
     def _print_header(self) -> None:
         c = self.cfg
         delta = "disabled" if c.delta is None else f"{c.delta:.2f}"
-        merge_thr = (
-            self._maint._effective_merge_threshold() if c.merge_threshold is None
-            else c.merge_threshold
-        )
-        self._print_line("Live churn monitor — in-place maintenance")
+        stats = self._maint.stats()
+        self._print_line(f"Live churn monitor — {c.strategy} maintenance")
         self._print_line(
             f"  dataset={c.dataset} dim={c.dim} seed={c.seed} "
             f"initial_size={c.initial_size} live={len(self._live)} "
-            f"postings={len(self._maint._segment.postings)} "
-            f"depth={len(self._maint._segment.levels)}"
+            f"postings={stats.get('n_postings', 0)} "
+            f"depth={stats.get('depth', 0)}"
         )
-        self._print_line(
-            f"  leaf_size={c.leaf_size} branching_factor={c.branching_factor} "
-            f"split_threshold={c.split_threshold} merge_threshold={merge_thr} "
-            f"delta={delta}"
-        )
+        if c.strategy == "inplace":
+            merge_thr = (
+                self._maint._effective_merge_threshold() if c.merge_threshold is None
+                else c.merge_threshold
+            )
+            self._print_line(
+                f"  leaf_size={c.leaf_size} branching_factor={c.branching_factor} "
+                f"split_threshold={c.split_threshold} merge_threshold={merge_thr} "
+                f"delta={delta}"
+            )
+        else:
+            self._print_line(
+                f"  leaf_size={c.leaf_size} branching_factor={c.branching_factor} "
+                f"memtable_limit={c.memtable_limit} "
+                f"compaction_threshold={c.compaction_threshold} "
+                f"delta={delta}"
+            )
         self._print_line(
             f"  k={c.k} query_count={c.query_count} interval={c.interval:.2f}s "
             f"audit_every={c.audit_every}"
@@ -660,14 +783,28 @@ class LiveChurnMonitor:
         avg_op = self._op_time_sum / self._op_count if self._op_count else 0.0
         best = self._recall_best if self._recall_n else float("nan")
         worst = self._recall_worst if self._recall_n else float("nan")
-        self._print_line(
-            f"--- summary @ op {self._op_count}: inserts={self._inserts} "
-            f"deletes={self._deletes} splits={self._counters.splits} "
-            f"merges={self._counters.merges} live={len(self._live)} "
-            f"postings={len(self._maint._segment.postings)} "
-            f"recall mean={mean_recent:.4f} best={best:.4f} worst={worst:.4f} "
-            f"avg_op={avg_op * 1000:.2f}ms"
-        )
+        stats = self._maint.stats()
+        leaves = stats.get("n_postings", 0)
+        if self.cfg.strategy == "inplace":
+            self._print_line(
+                f"--- summary @ op {self._op_count}: inserts={self._inserts} "
+                f"deletes={self._deletes} splits={self._counters.splits} "
+                f"merges={self._counters.merges} live={len(self._live)} "
+                f"postings={leaves} "
+                f"recall mean={mean_recent:.4f} best={best:.4f} worst={worst:.4f} "
+                f"avg_op={avg_op * 1000:.2f}ms"
+            )
+        else:
+            self._print_line(
+                f"--- summary @ op {self._op_count}: inserts={self._inserts} "
+                f"deletes={self._deletes} flushes={self._counters.flushes} "
+                f"compactions={self._counters.compaction_events} "
+                f"sealed={stats.get('sealed_segments', 0)} "
+                f"memtable={stats.get('memtable_size', 0)} "
+                f"live={len(self._live)} postings={leaves} "
+                f"recall mean={mean_recent:.4f} best={best:.4f} worst={worst:.4f} "
+                f"avg_op={avg_op * 1000:.2f}ms"
+            )
 
     def _print_final(self) -> None:
         latest = "N/A" if self._last_recall is None else f"{self._last_recall:.4f}"
@@ -676,21 +813,37 @@ class LiveChurnMonitor:
         reason = "Ctrl+C" if self._interrupted else (
             "audit failure" if self._failed else "completed"
         )
+        stats = self._maint.stats()
+        leaves = stats.get("n_postings", 0)
         self._print_line("=" * 52)
         self._print_line("Final summary")
         self._print_line(
             f"  operations={self._op_count} inserts={self._inserts} "
             f"deletes={self._deletes}"
         )
-        self._print_line(
-            f"  splits={self._counters.splits} merges={self._counters.merges} "
-            f"hierarchy_rebuilds={self._counters.hierarchy_rebuilds}"
-        )
-        self._print_line(
-            f"  live={len(self._live)} "
-            f"postings={len(self._maint._segment.postings)} "
-            f"tombstones={len(self._maint._tombstones)}"
-        )
+        if self.cfg.strategy == "inplace":
+            self._print_line(
+                f"  splits={self._counters.splits} merges={self._counters.merges} "
+                f"hierarchy_rebuilds={self._counters.hierarchy_rebuilds}"
+            )
+            self._print_line(
+                f"  live={len(self._live)} "
+                f"postings={leaves} "
+                f"tombstones={len(self._maint._tombstones)}"
+            )
+        else:
+            self._print_line(
+                f"  flushes={self._counters.flushes} "
+                f"compactions={self._counters.compaction_events} "
+                f"hierarchy_rebuilds={self._counters.hierarchy_rebuilds}"
+            )
+            self._print_line(
+                f"  live={len(self._live)} "
+                f"sealed_segments={stats.get('sealed_segments', 0)} "
+                f"memtable={stats.get('memtable_size', 0)} "
+                f"postings={leaves} "
+                f"tombstones={len(self._maint._tombstones)}"
+            )
         self._print_line(
             f"  latest recall@{self.cfg.k}={latest} "
             f"best={best} worst={worst}"
@@ -798,6 +951,12 @@ def build_parser() -> argparse.ArgumentParser:
                    action="store_true",
                    help="keep running after an audit failure (default: stop so "
                         "the failure is visible and reproducible)")
+    p.add_argument("--strategy", choices=["inplace", "outofplace"], default="inplace",
+                   help="maintenance strategy: 'inplace' (SPFresh) or 'outofplace' (LSM-Vec) (default: inplace)")
+    p.add_argument("--memtable-limit", dest="memtable_limit", type=int, default=50,
+                   help="flush threshold for out-of-place (default: 50)")
+    p.add_argument("--compaction-threshold", dest="compaction_threshold", type=int, default=4,
+                   help="sealed segment count triggering compaction for out-of-place (default: 4)")
     p.add_argument("--max-operations", dest="max_operations", type=int,
                    default=None,
                    help="demo/testing aid: stop after N operations "
@@ -812,6 +971,7 @@ def resolve_config(args: argparse.Namespace) -> LiveChurnConfig:
         else leaf_size
     )
     return LiveChurnConfig(
+        strategy=getattr(args, "strategy", "inplace"),
         initial_size=int(args.initial_size),
         k=int(args.k),
         query_count=int(args.query_count),
@@ -831,6 +991,8 @@ def resolve_config(args: argparse.Namespace) -> LiveChurnConfig:
         n_postings=int(args.n_postings),
         beam=int(args.beam),
         continue_on_audit_failure=bool(args.continue_on_audit_failure),
+        memtable_limit=int(getattr(args, "memtable_limit", 50)),
+        compaction_threshold=int(getattr(args, "compaction_threshold", 4)),
     )
 
 
