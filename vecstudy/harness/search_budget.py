@@ -490,6 +490,8 @@ def run_base_config(cfg: CompareConfig, strategy: str, presets: list[SearchPrese
 
     identity = {
         "dataset": cfg.dataset, "dataset_checksum": dataset_checksum,
+        "dim": cfg.dim,
+        "initial_size": cfg.initial_size, "reserve_size": cfg.reserve_size,
         "workload": cfg.workload, "insert_prob": cfg.insert_prob,
         "seed": cfg.seed, "trace_seed": trace.seed, "trace_hash": trace.trace_hash,
         "depth_config": cfg.depth if cfg.depth is not None else -1,
