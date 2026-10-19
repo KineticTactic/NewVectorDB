@@ -64,8 +64,6 @@ import numpy as np
 from ..core.config import QueryConfig
 from ..core.metrics import Counters
 from ..index.segment import Segment
-from ..maintain.inplace import InPlaceMaintainer
-from ..maintain.outofplace import OutOfPlaceMaintainer
 from .churn import (
     generate_churn_trace,
     audit_maintainer,
@@ -99,6 +97,14 @@ from .compare import (
     render_table,
     write_csv,
     write_parquet,
+)
+from .structure import (
+    build_structure_row,
+    event_fields,
+    make_instrumented_maintainer,
+    structure_metadata,
+    structure_snapshot,
+    timing_fields,
 )
 
 BEAM_DEFAULT = [2, 4, 8, 16, 32]
@@ -464,6 +470,7 @@ class RunInfo:
     failed: bool = False
     error: str = ""
     immutability_violations: int = 0
+    structure_rows: list[dict] = field(default_factory=list)
 
 
 def run_base_config(cfg: CompareConfig, strategy: str, presets: list[SearchPreset], *,
@@ -477,12 +484,8 @@ def run_base_config(cfg: CompareConfig, strategy: str, presets: list[SearchPrese
     cfg_m = _maintain_config(cfg, strategy)
     counters = Counters()
     try:
-        if strategy == "inplace":
-            maint = InPlaceMaintainer(vectors, cfg_idx, cfg_m, counters,
-                                      initial_segment=initial_segment.clone())
-        else:
-            maint = OutOfPlaceMaintainer(vectors, cfg_idx, cfg_m, counters,
-                                         initial_segment=initial_segment.clone())
+        maint = make_instrumented_maintainer(
+            strategy, vectors, cfg_idx, cfg_m, counters, initial_segment)
     except Exception as exc:                                    # pragma: no cover
         info.failed = True
         info.error = f"construction failed: {exc!r}"
@@ -509,14 +512,50 @@ def run_base_config(cfg: CompareConfig, strategy: str, presets: list[SearchPrese
     delete_ns: list[int] = []
     cp_idx = 0
 
+    # Structural instrumentation state (observational only).
+    prev_maint_ns = 0
+    prev_pruned = 0
+    prev_update_ns = 0
+    total_update_ns = 0
+    n_total = int(vectors.shape[0])
+
     def checkpoint(cp: int, ops: int) -> None:
-        nonlocal prev_maint
+        nonlocal prev_maint, prev_maint_ns, prev_pruned, prev_update_ns
         before = _maint_snapshot(counters)
         snap = _capture_snapshot(
             checkpoint=cp, ops=ops, live=live, maint=maint, counters=counters,
             prev_maint=prev_maint, queries=queries, vectors=vectors, cfg=cfg,
             strategy=strategy, insert_ns=insert_ns, delete_ns=delete_ns,
         )
+        structure = structure_snapshot(
+            strategy=strategy, maint=maint, live=live, n_total=n_total,
+            split_threshold=cfg.split_threshold,
+        )
+        maint_ns = maint.maintenance_ns
+        pruned = maint.pruned_postings
+        events = event_fields(
+            strategy=strategy, cumulative=snap.maint_cumulative,
+            interval=snap.maint_delta,
+            pruned_cumulative=pruned,
+            pruned_interval=(None if pruned is None else pruned - prev_pruned),
+        )
+        timing = timing_fields(
+            maintenance_ns=maint_ns, prev_maintenance_ns=prev_maint_ns,
+            update_ns=total_update_ns, prev_update_ns=prev_update_ns,
+        )
+        info.structure_rows.append(build_structure_row(
+            identity=identity, experiment_id=experiment_id, run_index=run_index,
+            strategy=strategy, checkpoint=cp, operations_processed=ops,
+            live_vector_count=snap.live_count, structure=structure, events=events,
+            timing=timing,
+            correctness_status=("PASSED" if snap.checkpoint_correct else "FAILED"),
+            checkpoint_correct=snap.checkpoint_correct,
+        ))
+        prev_maint_ns = maint_ns
+        if pruned is not None:
+            prev_pruned = pruned
+        prev_update_ns = total_update_ns
+
         for preset in presets:
             rows.append(_evaluate_preset(
                 snap, preset, queries, cfg, strategy=strategy,
@@ -544,6 +583,7 @@ def run_base_config(cfg: CompareConfig, strategy: str, presets: list[SearchPrese
             live.discard(int(vid))
         t1 = time.perf_counter_ns()
         maint.maintain()
+        total_update_ns += time.perf_counter_ns() - t0
         (insert_ns if op_type == "insert" else delete_ns).append(t1 - t0)
         done += 1
         if done % checkpoint_interval == 0 or done == total_ops:
@@ -1077,6 +1117,7 @@ def run_experiment(spec: BudgetSpec, *, progress: bool = True) -> dict[str, list
     cells = spec.base_configs()
     raw: list[dict] = []
     infos: list[RunInfo] = []
+    structure_rows: list[dict] = []
 
     if progress:
         print(f"Experiment id: {experiment_id}")
@@ -1107,6 +1148,7 @@ def run_experiment(spec: BudgetSpec, *, progress: bool = True) -> dict[str, list
                 dataset_checksum=dcs,
             )
             raw.extend(rows)
+            structure_rows.extend(info.structure_rows)
             infos.append(info)
             if progress:
                 print(f"[sb] run={run_index:<3} {strategy:<10} "
@@ -1151,6 +1193,7 @@ def run_experiment(spec: BudgetSpec, *, progress: bool = True) -> dict[str, list
         "results_budget_selection.csv":
             [p.to_row() for p in selection_picks] if selection_picks else [],
         "results_budget_oracle.csv": oracle,
+        "results_structure_checkpoints.csv": structure_rows,
     }
     meta = {
         "invocation_id": experiment_id,
@@ -1202,7 +1245,9 @@ def run_experiment(spec: BudgetSpec, *, progress: bool = True) -> dict[str, list
         "immutability_violations": immut,
         "run_errors": errors,
         "n_raw_rows": len(raw),
+        "n_structure_rows": len(structure_rows),
         "n_matched_rows": len(matched),
+        "structure_metrics": structure_metadata(),
         "calibration_results": (str(spec.calibration_results)
                                 if spec.calibration_results else None),
         "output_schema": _output_schema(files),
@@ -1214,7 +1259,8 @@ def run_experiment(spec: BudgetSpec, *, progress: bool = True) -> dict[str, list
     for name, rows in files.items():
         write_csv(out_dir / name, rows)
         written[name] = len(rows)
-    for name in ("results_budget_raw.csv", "results_budget_matched.csv"):
+    for name in ("results_budget_raw.csv", "results_budget_matched.csv",
+                 "results_structure_checkpoints.csv"):
         rows = files[name]
         if write_parquet(out_dir / name.replace(".csv", ".parquet"), rows):
             written[name.replace(".csv", ".parquet")] = len(rows)
